@@ -7,3 +7,7 @@ https://www.anthropic.com/engineering/building-effective-agents
 ```
 https://arxiv.org/pdf/2210.03629
 ```
+### how to turn this into youtube videos
+```
+https://aws.amazon.com/what-is/ai-agents/#what-are-ai-agents--njg10c
+```
