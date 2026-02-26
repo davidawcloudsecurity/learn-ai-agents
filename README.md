@@ -1,4 +1,12 @@
 # learn-ai-agents
+### Demostrate understanding of LLM/AI
+```
+Build Text Generation
+ChatBots
+Classification
+Translation
+Summarization
+```
 ### What is prompt engineering
 
 ### What is context engineering
