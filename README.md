@@ -1,4 +1,10 @@
 # learn-ai-agents
+### Resources
+```
+https://www.langchain.com/langgraph
+https://strandsagents.com/latest/
+https://www.crewai.com/
+```
 ### Demostrate understanding of LLM/AI
 ```
 Build Text Generation
