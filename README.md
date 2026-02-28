@@ -1,4 +1,8 @@
 # learn-ai-agents
+### How to let ai agents see
+```
+https://towardsdatascience.com/building-visual-agents-that-can-navigate-the-web-autonomously-1184efbfe895/
+```
 ### How to browse the web for ai agents
 ```
 https://docs.browser-use.com/introduction
