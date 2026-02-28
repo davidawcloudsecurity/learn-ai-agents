@@ -1,4 +1,9 @@
 # learn-ai-agents
+### How to browse the web for ai agents
+```
+https://docs.browser-use.com/introduction
+https://github.com/browser-use/browser-use
+```
 ### Resources
 ```
 https://www.langchain.com/langgraph
