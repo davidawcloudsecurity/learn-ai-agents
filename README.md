@@ -1,4 +1,13 @@
 # learn-ai-agents
+### How to observe ai agents
+```
+https://strandsagents.com/latest/documentation/docs/user-guide/observability-evaluation/observability/
+https://opentelemetry.io/
+https://www.langchain.com/langsmith
+https://langfuse.com/
+https://docs.ragas.io/en/stable/
+https://arize.com/
+```
 ### How to let ai agents see
 ```
 https://towardsdatascience.com/building-visual-agents-that-can-navigate-the-web-autonomously-1184efbfe895/
