@@ -1,33 +1,30 @@
 # This is a basic workflow to help you get started with Actions
-name: learn-ai-agents-apply
+name: learn-ai-agents-destroy
 
-# Controls when the action will run. Invokes the workflow on push events but only for the main branch
 on:
   workflow_dispatch:
 
 env:
-  
   AWS_REGION : "us-east-1" #Change to reflect your Region
   IAM_ROLE_NAME: "demo-project-ec2-role"
   IAM_PROFILE_NAME: "demo-project-ec2-profile"
-
+  
 # Permission can be added at job level or workflow level    
 permissions:
       id-token: write   # This is required for requesting the JWT
       contents: write    # This is required for actions/checkout
 jobs:
-  AssumeRoleAndCallIdentity:
+  Destroy:
     runs-on: ubuntu-latest
     steps:
       - name: Git clone the repository
-        uses: actions/checkout@v3  
+        uses: actions/checkout@v3
       - name: configure aws credentials
         uses: aws-actions/configure-aws-credentials@v1.7.0
         with:
           role-to-assume: arn:aws:iam::762595429056:role/GithubActions #change to reflect your IAM role’s ARN
           role-session-name: GitHub_to_AWS_via_FederatedOIDC
           aws-region: ${{ env.AWS_REGION }}
-
       # Hello from AWS: WhoAmI
       - name: Sts GetCallerIdentity
         run: |
@@ -36,72 +33,48 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v1
         
-      # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
-      - name: Terraform Init
+      - name: Initialize, validate, format Terraform
         run: |
-          # Pull existing state from destroy/main branch if it exists
-          echo "Checking for existing Terraform state..."
-          git fetch origin destroy/main 2>/dev/null || echo "destroy/main branch doesn't exist yet"
-          if git show-branch remotes/origin/destroy/main 2>/dev/null; then
-              echo "Found destroy/main branch, checking for state files..."
-              git checkout destroy/main
-              if [ -d "state" ] && [ -f "state/terraform.tfstate" ]; then
-                  echo "Found existing state, copying to working directory..."
-                  cp state/terraform.tfstate ./terraform.tfstate
-              fi
-              git checkout main
-          fi
-          
-          # Clean up any orphaned IAM resources before applying
+          ls -lah
+          pwd
+          ls -lah state
+          mv state/terraform.tfstate ./terraform.tfstate
+          ls -lah
+          echo "Terraform init"
+          echo ""
+          terraform init
+          terraform validate
+          terraform fmt
+        working-directory: infra_terraform        
+
+      - name: Terraform State
+        run: terraform state list
+        working-directory: infra_terraform
+      
+      - name: Terraform Destroy Targeted Resources
+        run: |
+          terraform destroy -auto-approve -input=false
           echo "Cleaning up any existing IAM resources..."
           aws iam remove-role-from-instance-profile --instance-profile-name ${{ env.IAM_PROFILE_NAME }} --role-name ${{ env.IAM_ROLE_NAME }} 2>/dev/null || true
           aws iam delete-instance-profile --instance-profile-name ${{ env.IAM_PROFILE_NAME }} 2>/dev/null || true
-          aws iam delete-role --role-name ${{ env.IAM_ROLE_NAME }} 2>/dev/null || true
-          
-          terraform init
-          terraform fmt
-          terraform validate
-          terraform plan
-          terraform apply --auto-approve
+          aws iam delete-role --role-name ${{ env.IAM_ROLE_NAME }} 2>/dev/null || true  
         working-directory: infra_terraform
 
-      - name: Git Config
+      - name: Clean tfstate and Git
         run: |
+          echo "" > state/terraform.tfstate
+          mv terraform.tfstate state                    
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/davidawcloudsecurity/learn-ai-agents.git                   
-          # Get the latest commit hash
-          COMMIT_HASH=$(git rev-parse --short HEAD)          
-          
-          # Fetch the latest changes from the remote 'destroy/main' branch
-          git status
-          echo "git fetch"
+          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/davidawcloudsecurity/learn-ai-agents.git                   
           git fetch origin destroy/main
-          git add main.tf
-          git commit -m "random-${COMMIT_HASH}"
-          cp main.tf main.tf.origin
-          git stash
-          echo "git checkout"
           git checkout destroy/main
-          echo "git merge"
           git merge origin/destroy/main
-          mv main.tf.origin main.tf
-          if [ -f terraform.tfstate ]; then
-            mv terraform.tfstate state/
-            git add state
-          fi
-          git add main.tf
-          git commit -m "random-${COMMIT_HASH}"
-          # Push the changes to the 'destroy/main' branch
-          git push origin destroy/main
-        continue-on-error: true  # Critical: Continue even if backup fails                    
+          # Get the latest commit hash
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          git add state
+          git commit -m "clean-${COMMIT_HASH}"    
+          git push -u origin          
+          pwd
         working-directory: infra_terraform
-
-      - name: Terraform Destroy on Failure
-        if: failure()
-        run: |
-          terraform destroy -auto-approve -input=false
-          # Force cleanup any remaining IAM resources that Terraform might have missed
-          aws iam delete-role --role-name ${{ env.IAM_ROLE_NAME }} 2>/dev/null || true
-          aws iam delete-instance-profile --instance-profile-name ${{ env.IAM_PROFILE_NAME }} 2>/dev/null || true
-        working-directory: infra_terraform
+          
