@@ -41,6 +41,25 @@ minimax-m2:7
 glm-4.7-flash
 qwen3.5
 ```
+### arm
+```
+| Instance      | vCPUs |   RAM | Good?                      |
+| ------------- | ----: | ----: | -------------------------- |
+| `t3.large`    |     2 |  8 GB | Small testing              |
+| `m7g.xlarge`  |     4 | 16 GB | Good starter               |
+| `c7g.2xlarge` |     8 | 16 GB | Faster inference           |
+| `c7g.4xlarge` |    16 | 32 GB | BEST you can currently run |
+| `r7g.2xlarge` |     8 | 64 GB | Big-context models         |
+```
+### x86
+```
+| Instance      | vCPUs |   RAM | CPU Type |
+| ------------- | ----: | ----: | -------- |
+| `c6a.2xlarge` |     8 | 16 GB | AMD EPYC |
+| `c6a.4xlarge` |    16 | 32 GB | AMD EPYC |
+| `m6a.4xlarge` |    16 | 64 GB | AMD EPYC |
+| `r6a.2xlarge` |     8 | 64 GB | AMD EPYC |
+```
 # learn-ai-agents
 ### How to observe ai agents
 ```
