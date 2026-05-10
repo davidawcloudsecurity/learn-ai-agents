@@ -215,6 +215,10 @@ resource "aws_instance" "backend" {
               cd app
               npm install
               npm install -g pm2
+              cd /opt
+              npm install -g @anthropic-ai/claude-code              
+              curl -fsSL https://ollama.com/install.sh | sh
+              curl -LO https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-x64.tar.gz
               EOF
 
   tags = {
