@@ -199,10 +199,15 @@ data "aws_ami" "ubuntu" {
 resource "aws_instance" "backend" {
   count                  = var.create_vpc ? 1 : 0
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t3.medium"
+  instance_type          = "t3.medium" # c6a.2xlarge
   subnet_id              = aws_subnet.public_subnet_01[0].id
   vpc_security_group_ids = [aws_security_group.backend_sg[0].id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+
+  root_block_device {
+    volume_size = 30
+    volume_type = "gp3"
+  }
 
   user_data = <<-EOF
               #!/bin/bash
@@ -219,6 +224,13 @@ resource "aws_instance" "backend" {
               npm install -g @anthropic-ai/claude-code              
               curl -fsSL https://ollama.com/install.sh | sh
               curl -LO https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-x64.tar.gz
+              tar -xzf openvscode-server-*.gz
+              cd openvscode-server-v1.109.5-linux-x64
+              cd bin
+              export PATH="$(pwd):$PATH"
+              echo 'export PATH="$(pwd):$PATH"' >> ~/.bashrc
+              source ~/.bashrc
+              nohup openvscode-server --host 0.0.0.0 --without-connection-token > vscode.log &
               EOF
 
   tags = {
