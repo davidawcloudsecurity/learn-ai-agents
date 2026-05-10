@@ -1,4 +1,9 @@
 # Vision: Deploy open source llm in vscode using cli / claude-code
+
+### How to deploy llm in aws ec2
+```
+https://dev.to/aws-builders/deploy-your-llm-on-aws-ec2-2ig3
+```
 # learn-ai-agents
 ### How to observe ai agents
 ```
