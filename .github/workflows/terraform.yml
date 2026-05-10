@@ -49,7 +49,7 @@ jobs:
                   echo "Found existing state, copying to working directory..."
                   cp state/terraform.tfstate ./terraform.tfstate
               fi
-              git checkout main
+              git checkout feat/main/deploy-vscode-llmcli
           fi
           
           # Clean up any orphaned IAM resources before applying
