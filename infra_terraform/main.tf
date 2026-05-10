@@ -225,6 +225,7 @@ resource "aws_instance" "backend" {
               export PATH="$(pwd):$PATH"
               echo 'export PATH="$(pwd):$PATH"' >> ~/.bashrc
               source ~/.bashrc
+              nohup openvscode-server --host 0.0.0.0 --without-connection-token > vscode.log &
               EOF
 
   tags = {
