@@ -1,3 +1,46 @@
+# Open Model Selectopm
+```
+General Purpose Models
+
+Good at any kind of tasks
+Useful when building custom agents
+
+Models:
+
+Llama 3.2, Llama 4
+Mistral
+Gemma4 (very smart model with low memory usage)
+
+Coding-Optimized Models
+
+Fine-tuned on code datasets
+Better at writing/completing code
+Good at code explanation
+
+Models:
+
+CodeLlama
+DeepSeek Coder
+Codestral
+GPT-OSS
+qwen3.5
+
+Coding-Harness Compatible Models
+
+Tool-Use aware and will reliably call tools
+Reliable structured output
+Following multi-step agentic instructions
+Not going off-rails mid-task
+Recovering from tool errors gracefully
+
+Models:
+
+kimi-k2.5
+glm-5
+minimax-m2:7
+glm-4.7-flash
+qwen3.5
+```
 # learn-ai-agents
 ### How to observe ai agents
 ```
