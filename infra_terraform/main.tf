@@ -211,7 +211,7 @@ resource "aws_instance" "backend" {
 
   user_data = <<-EOF
               #!/bin/bash
-              apt update
+              apt update -y
               apt install -y git curl
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               apt install -y nodejs
