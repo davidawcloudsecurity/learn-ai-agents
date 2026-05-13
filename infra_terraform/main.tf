@@ -199,7 +199,7 @@ data "aws_ami" "ubuntu" {
 resource "aws_instance" "backend" {
   count                  = var.create_vpc ? 1 : 0
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t3.medium" # c6a.2xlarge
+  instance_type          = "t3.medium" # c6a.2xlarge / g4dn.xlarge
   subnet_id              = aws_subnet.public_subnet_01[0].id
   vpc_security_group_ids = [aws_security_group.backend_sg[0].id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
