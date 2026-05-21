@@ -92,27 +92,25 @@ resource "aws_route_table_association" "public_rta" {
   route_table_id = aws_route_table.public_rt[0].id
 }
 
-# Security Group for Frontend - only ALB can reach it on port 80
+# Security Group for Frontend
 resource "aws_security_group" "frontend_sg" {
   count       = var.create_vpc ? 1 : 0
   name        = "${var.project_tag}-frontend-sg"
-  description = "Security group for frontend EC2 - ALB access only"
+  description = "Security group for frontend EC2"
   vpc_id      = aws_vpc.demo_main_vpc[0].id
 
   ingress {
-    description     = "HTTP from ALB only"
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg[0].id]
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
-    description = "SSH from admin IP only"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = var.admin_cidr_blocks
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -127,27 +125,25 @@ resource "aws_security_group" "frontend_sg" {
   }
 }
 
-# Security Group for Backend - VPC internal + admin SSH only
+# Security Group for Backend
 resource "aws_security_group" "backend_sg" {
   count       = var.create_vpc ? 1 : 0
   name        = "${var.project_tag}-backend-sg"
-  description = "Security group for backend EC2 - VPC internal only"
+  description = "Security group for backend EC2"
   vpc_id      = aws_vpc.demo_main_vpc[0].id
 
   ingress {
-    description = "App port from VPC"
     from_port   = 8000
     to_port     = 8000
     protocol    = "tcp"
-    cidr_blocks = [var.main_cidr_block]
+    cidr_blocks = ["172.16.0.0/16"]
   }
 
   ingress {
-    description = "SSH from admin IP only"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = var.admin_cidr_blocks
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -306,32 +302,25 @@ resource "aws_instance" "frontend" {
 # ALB + CloudFront for Frontend
 # =============================================================================
 
-# AWS managed prefix list for CloudFront origin-facing IPs
-data "aws_ec2_managed_prefix_list" "cloudfront" {
-  name = "com.amazonaws.global.cloudfront.origin-facing"
-}
-
-# Security Group for ALB - only CloudFront can reach it
+# Security Group for ALB
 resource "aws_security_group" "alb_sg" {
   count       = var.create_vpc ? 1 : 0
   name        = "${var.project_tag}-alb-sg"
-  description = "Security group for ALB - CloudFront only"
+  description = "Security group for ALB"
   vpc_id      = aws_vpc.demo_main_vpc[0].id
 
   ingress {
-    description     = "HTTP from CloudFront"
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
-    description     = "HTTPS from CloudFront"
-    from_port       = 443
-    to_port         = 443
-    protocol        = "tcp"
-    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
