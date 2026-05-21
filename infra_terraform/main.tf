@@ -199,7 +199,7 @@ data "aws_ami" "ubuntu" {
 resource "aws_instance" "backend" {
   count                  = var.create_vpc ? 1 : 0
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t3.medium" # c6a.2xlarge
+  instance_type          = "t3.medium" # c6a.2xlarge / g4dn.xlarge
   subnet_id              = aws_subnet.public_subnet_01[0].id
   vpc_security_group_ids = [aws_security_group.backend_sg[0].id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
@@ -211,7 +211,7 @@ resource "aws_instance" "backend" {
 
   user_data = <<-EOF
               #!/bin/bash
-              apt update
+              apt update -y
               apt install -y git curl
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               apt install -y nodejs
@@ -228,7 +228,7 @@ resource "aws_instance" "backend" {
               cd openvscode-server-v1.109.5-linux-x64
               cd bin
               export PATH="$(pwd):$PATH"
-              echo 'export PATH="$(pwd):$PATH"' >> ~/.bashrc
+              echo "export PATH=\"$(pwd):\$PATH\"" >> ~/.bashrc
               source ~/.bashrc
               nohup openvscode-server --host 0.0.0.0 --without-connection-token > vscode.log &
               EOF
@@ -296,4 +296,220 @@ resource "aws_instance" "frontend" {
   tags = {
     Name = "${var.project_tag}-frontend"
   }
+}
+
+# =============================================================================
+# ALB + CloudFront for Frontend
+# =============================================================================
+
+# Security Group for ALB
+resource "aws_security_group" "alb_sg" {
+  count       = var.create_vpc ? 1 : 0
+  name        = "${var.project_tag}-alb-sg"
+  description = "Security group for ALB"
+  vpc_id      = aws_vpc.demo_main_vpc[0].id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_tag}-alb-sg"
+  }
+}
+
+# Application Load Balancer
+resource "aws_lb" "frontend_alb" {
+  count              = var.create_vpc ? 1 : 0
+  name               = "${var.project_tag}-frontend-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg[0].id]
+  subnets            = aws_subnet.public_subnet_01[*].id
+
+  tags = {
+    Name = "${var.project_tag}-frontend-alb"
+  }
+}
+
+# Target Group for Frontend EC2
+resource "aws_lb_target_group" "frontend_tg" {
+  count    = var.create_vpc ? 1 : 0
+  name     = "${var.project_tag}-frontend-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.demo_main_vpc[0].id
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    path                = "/"
+    matcher             = "200"
+  }
+
+  tags = {
+    Name = "${var.project_tag}-frontend-tg"
+  }
+}
+
+# Register Frontend EC2 with Target Group
+resource "aws_lb_target_group_attachment" "frontend_tg_attachment" {
+  count            = var.create_vpc ? 1 : 0
+  target_group_arn = aws_lb_target_group.frontend_tg[0].arn
+  target_id        = aws_instance.frontend[0].id
+  port             = 80
+}
+
+# ALB Listener (HTTP)
+resource "aws_lb_listener" "frontend_http" {
+  count             = var.create_vpc ? 1 : 0
+  load_balancer_arn = aws_lb.frontend_alb[0].arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.frontend_tg[0].arn
+  }
+}
+
+# CloudFront Distribution
+resource "aws_cloudfront_distribution" "frontend_cdn" {
+  count   = var.create_vpc ? 1 : 0
+  enabled = true
+  comment = "${var.project_tag} frontend distribution"
+
+  origin {
+    domain_name = aws_lb.frontend_alb[0].dns_name
+    origin_id   = "alb-frontend"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "alb-frontend"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = true
+      headers      = ["Origin", "Authorization"]
+
+      cookies {
+        forward = "all"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+  }
+
+  # Cache behavior for /api/* - no caching, pass everything through
+  ordered_cache_behavior {
+    path_pattern           = "/api/*"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "alb-frontend"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = true
+      headers      = ["*"]
+
+      cookies {
+        forward = "all"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+  }
+
+  # Cache behavior for static assets
+  ordered_cache_behavior {
+    path_pattern           = "/assets/*"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "alb-frontend"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 86400
+    max_ttl     = 31536000
+    compress    = true
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  tags = {
+    Name = "${var.project_tag}-frontend-cdn"
+  }
+}
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+output "cloudfront_domain_name" {
+  description = "CloudFront distribution domain name"
+  value       = var.create_vpc ? aws_cloudfront_distribution.frontend_cdn[0].domain_name : null
+}
+
+output "alb_dns_name" {
+  description = "ALB DNS name"
+  value       = var.create_vpc ? aws_lb.frontend_alb[0].dns_name : null
+}
+
+output "frontend_instance_public_ip" {
+  description = "Frontend EC2 public IP"
+  value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
+}
+
+output "backend_instance_public_ip" {
+  description = "Backend EC2 public IP"
+  value       = var.create_vpc ? aws_instance.backend[0].public_ip : null
 }
