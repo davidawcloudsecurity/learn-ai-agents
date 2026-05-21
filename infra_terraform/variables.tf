@@ -33,9 +33,3 @@ variable "azs" {
   type        = list(string)
   default     = ["us-east-1a", "us-east-1b"]
 }
-
-variable "admin_cidr_blocks" {
-  description = "CIDR blocks allowed for SSH access (e.g. your office/home IP)"
-  type        = list(string)
-  default     = ["10.0.0.0/8"]
-}
