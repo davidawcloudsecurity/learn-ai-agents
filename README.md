@@ -1,4 +1,4 @@
-# Open Model Selectopm
+# Open Model
 ```
 General Purpose Models
 
