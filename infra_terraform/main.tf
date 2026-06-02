@@ -308,10 +308,34 @@ resource "aws_instance" "frontend" {
               apt install -y nginx git curl
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               apt install -y nodejs
+              rm /etc/nginx/sites-enabled/default
+              cat > /etc/nginx/sites-available/app <<'NGINX'
+              server {
+                listen 80;
+                root /opt/app/dist;
+                index index.html;
+                location /api/ {
+                  proxy_pass http://localhost:8501;
+                  # Increase timeouts for slow LLM responses
+                  proxy_read_timeout 300s;      # 5 minutes
+                  proxy_connect_timeout 75s;
+                  proxy_send_timeout 300s;
+                  
+                  # Important for streaming
+                  proxy_buffering off;
+                  proxy_cache off;
+                }
+                location / {
+                  try_files $uri /index.html;
+                }
+              }
+              NGINX
+              ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/
+              systemctl restart nginx
               cd /opt
               git clone --filter=blob:none --sparse https://github.com/davidawcloudsecurity/learn-claude-code-workshops.git app
               cd app
-              git sparse-checkout set ship-your-first-managed-agent              
+              git sparse-checkout set ship-your-first-managed-agent
               EOF
 
   tags = {
@@ -374,7 +398,7 @@ resource "aws_lb" "frontend_alb" {
 resource "aws_lb_target_group" "frontend_tg" {
   count    = var.create_vpc ? 1 : 0
   name     = "${var.project_tag}-frontend-tg"
-  port     = 80
+  port     = 8501
   protocol = "HTTP"
   vpc_id   = aws_vpc.demo_main_vpc[0].id
 
@@ -398,7 +422,7 @@ resource "aws_lb_target_group_attachment" "frontend_tg_attachment" {
   count            = var.create_vpc ? 1 : 0
   target_group_arn = aws_lb_target_group.frontend_tg[0].arn
   target_id        = aws_instance.frontend[0].id
-  port             = 80
+  port             = 8501
 }
 
 # ALB Listener (HTTP)
