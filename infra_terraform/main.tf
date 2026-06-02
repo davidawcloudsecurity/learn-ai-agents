@@ -398,7 +398,7 @@ resource "aws_lb" "frontend_alb" {
 resource "aws_lb_target_group" "frontend_tg" {
   count    = var.create_vpc ? 1 : 0
   name     = "${var.project_tag}-frontend-tg"
-  port     = 80
+  port     = 8501
   protocol = "HTTP"
   vpc_id   = aws_vpc.demo_main_vpc[0].id
 
@@ -422,7 +422,7 @@ resource "aws_lb_target_group_attachment" "frontend_tg_attachment" {
   count            = var.create_vpc ? 1 : 0
   target_group_arn = aws_lb_target_group.frontend_tg[0].arn
   target_id        = aws_instance.frontend[0].id
-  port             = 80
+  port             = 8501
 }
 
 # ALB Listener (HTTP)
