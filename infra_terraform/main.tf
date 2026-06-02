@@ -177,6 +177,26 @@ resource "aws_iam_role_policy_attachment" "ssm_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Bedrock InvokeModel permission for Claude Sonnet
+resource "aws_iam_role_policy" "bedrock_invoke" {
+  name = "${var.project_tag}-bedrock-invoke"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ]
+      Resource = [
+        "arn:aws:bedrock:us-east-1::foundation-model/us.anthropic.claude-sonnet-4-20250514"
+      ]
+    }]
+  })
+}
+
 # Get latest Ubuntu AMI
 data "aws_ami" "ubuntu" {
   most_recent = true
