@@ -106,6 +106,13 @@ resource "aws_security_group" "frontend_sg" {
     security_groups = [aws_security_group.alb_sg[0].id]
   }
 
+  ingress {
+    from_port       = 8501
+    to_port         = 8501
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg[0].id]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
