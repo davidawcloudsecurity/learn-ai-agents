@@ -308,10 +308,34 @@ resource "aws_instance" "frontend" {
               apt install -y nginx git curl
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               apt install -y nodejs
+              rm /etc/nginx/sites-enabled/default
+              cat > /etc/nginx/sites-available/app <<'NGINX'
+              server {
+                listen 80;
+                root /opt/app/dist;
+                index index.html;
+                location /api/ {
+                  proxy_pass http://localhost:8501;
+                  # Increase timeouts for slow LLM responses
+                  proxy_read_timeout 300s;      # 5 minutes
+                  proxy_connect_timeout 75s;
+                  proxy_send_timeout 300s;
+                  
+                  # Important for streaming
+                  proxy_buffering off;
+                  proxy_cache off;
+                }
+                location / {
+                  try_files $uri /index.html;
+                }
+              }
+              NGINX
+              ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/
+              systemctl restart nginx
               cd /opt
               git clone --filter=blob:none --sparse https://github.com/davidawcloudsecurity/learn-claude-code-workshops.git app
               cd app
-              git sparse-checkout set ship-your-first-managed-agent              
+              git sparse-checkout set ship-your-first-managed-agent
               EOF
 
   tags = {
