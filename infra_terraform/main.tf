@@ -180,7 +180,7 @@ data "aws_ami" "ubuntu" {
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 }
-
+/*
 # Backend EC2 Instance
 resource "aws_instance" "backend" {
   count                  = var.create_vpc ? 1 : 0
@@ -223,7 +223,8 @@ resource "aws_instance" "backend" {
     Name = "${var.project_tag}-backend"
   }
 }
-
+*/
+/*
 # Frontend EC2 Instance
 resource "aws_instance" "frontend" {
   count                  = var.create_vpc ? 1 : 0
@@ -277,6 +278,40 @@ resource "aws_instance" "frontend" {
               systemctl restart nginx
               curl -fsSL https://ollama.com/install.sh | sh
               ollama run smollm:1.7b
+              EOF
+
+  tags = {
+    Name = "${var.project_tag}-frontend"
+  }
+}
+*/
+
+# Frontend EC2 Instance
+resource "aws_instance" "frontend" {
+  count                  = var.create_vpc ? 1 : 0
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.public_subnet_01[0].id
+  vpc_security_group_ids = [aws_security_group.frontend_sg[0].id]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+
+  root_block_device {
+    volume_size           = 30
+    volume_type           = "gp3"
+    delete_on_termination = true
+    encrypted             = true
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              apt update
+              apt install -y nginx git curl
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              apt install -y nodejs
+              cd /opt
+              git clone --filter=blob:none --sparse https://github.com/davidawcloudsecurity/learn-claude-code-workshops.git app
+              cd app
+              git sparse-checkout set ship-your-first-managed-agent              
               EOF
 
   tags = {
