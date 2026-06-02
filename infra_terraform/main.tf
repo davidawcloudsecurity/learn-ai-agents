@@ -529,8 +529,9 @@ output "frontend_instance_public_ip" {
   description = "Frontend EC2 public IP"
   value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
 }
-
+/*
 output "backend_instance_public_ip" {
   description = "Backend EC2 public IP"
   value       = var.create_vpc ? aws_instance.backend[0].public_ip : null
 }
+*/
