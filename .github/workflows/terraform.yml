@@ -65,36 +65,49 @@ jobs:
           terraform apply --auto-approve
         working-directory: infra_terraform
 
-      - name: Git Config
+      - name: Push tfstate to destroy/main branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/davidawcloudsecurity/learn-ai-agents.git                   
-          # Get the latest commit hash
-          COMMIT_HASH=$(git rev-parse --short HEAD)          
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/davidawcloudsecurity/learn-ai-agents.git
           
-          # Fetch the latest changes from the remote 'destroy/main' branch
-          git status
-          echo "git fetch"
-          git fetch origin destroy/main
-          git add main.tf
-          git commit -m "random-${COMMIT_HASH}"
-          cp main.tf main.tf.origin
-          git stash
-          echo "git checkout"
-          git checkout destroy/main
-          echo "git merge"
-          git merge origin/destroy/main
-          mv main.tf.origin main.tf
-          if [ -f terraform.tfstate ]; then
-            mv terraform.tfstate state/
-            git add state
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          
+          # Save tfstate and main.tf before switching branches
+          cp terraform.tfstate /tmp/terraform.tfstate
+          cp main.tf /tmp/main.tf
+          cp variables.tf /tmp/variables.tf
+          
+          # Save lock file if it exists
+          if [ -f .terraform.lock.hcl ]; then
+            cp .terraform.lock.hcl /tmp/.terraform.lock.hcl
           fi
-          git add main.tf
-          git commit -m "random-${COMMIT_HASH}"
-          # Push the changes to the 'destroy/main' branch
+          
+          # Switch to destroy/main branch
+          git fetch origin destroy/main 2>/dev/null || true
+          if git show-branch remotes/origin/destroy/main 2>/dev/null; then
+            git checkout destroy/main
+            git merge origin/destroy/main --no-edit 2>/dev/null || true
+          else
+            git checkout --orphan destroy/main
+            git rm -rf . 2>/dev/null || true
+          fi
+          
+          # Copy state into state/ directory
+          mkdir -p state
+          cp /tmp/terraform.tfstate state/terraform.tfstate
+          cp /tmp/main.tf main.tf
+          cp /tmp/variables.tf variables.tf
+          if [ -f /tmp/.terraform.lock.hcl ]; then
+            cp /tmp/.terraform.lock.hcl .terraform.lock.hcl
+            git add .terraform.lock.hcl
+          fi
+          
+          # Commit and push
+          git add state/terraform.tfstate main.tf variables.tf
+          git commit -m "update tfstate and config - ${COMMIT_HASH}" || echo "No changes to commit"
           git push origin destroy/main
-        continue-on-error: true  # Critical: Continue even if backup fails                    
+        continue-on-error: true
         working-directory: infra_terraform
 
       - name: Terraform Destroy on Failure
