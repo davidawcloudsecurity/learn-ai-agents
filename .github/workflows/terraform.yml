@@ -54,6 +54,20 @@ jobs:
           
           # Clean up any orphaned IAM resources before applying
           echo "Cleaning up any existing IAM resources..."
+          
+          # Detach all managed policies from the role
+          POLICIES=$(aws iam list-attached-role-policies --role-name ${{ env.IAM_ROLE_NAME }} --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null || true)
+          for POLICY_ARN in $POLICIES; do
+            aws iam detach-role-policy --role-name ${{ env.IAM_ROLE_NAME }} --policy-arn "$POLICY_ARN" 2>/dev/null || true
+          done
+          
+          # Delete all inline policies from the role
+          INLINE_POLICIES=$(aws iam list-role-policies --role-name ${{ env.IAM_ROLE_NAME }} --query 'PolicyNames[*]' --output text 2>/dev/null || true)
+          for POLICY_NAME in $INLINE_POLICIES; do
+            aws iam delete-role-policy --role-name ${{ env.IAM_ROLE_NAME }} --policy-name "$POLICY_NAME" 2>/dev/null || true
+          done
+          
+          # Remove role from instance profile, delete profile, then delete role
           aws iam remove-role-from-instance-profile --instance-profile-name ${{ env.IAM_PROFILE_NAME }} --role-name ${{ env.IAM_ROLE_NAME }} 2>/dev/null || true
           aws iam delete-instance-profile --instance-profile-name ${{ env.IAM_PROFILE_NAME }} 2>/dev/null || true
           aws iam delete-role --role-name ${{ env.IAM_ROLE_NAME }} 2>/dev/null || true
