@@ -66,7 +66,7 @@ resource "aws_route_table_association" "public" {
 # Security Groups
 # =============================================================================
 
-# ALB Security Group - allows inbound HTTP/HTTPS from anywhere
+# ALB Security Group - allows inbound HTTP/HTTPS from VPC CIDR
 resource "aws_security_group" "alb_sg" {
   count       = var.create_vpc ? 1 : 0
   name        = "${var.project_tag}-alb-sg"
@@ -74,19 +74,19 @@ resource "aws_security_group" "alb_sg" {
   vpc_id      = aws_vpc.main[0].id
 
   ingress {
-    description = "HTTP from anywhere"
+    description = "HTTP from VPC CIDR"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.main_cidr_block]
   }
 
   ingress {
-    description = "HTTPS from anywhere"
+    description = "HTTPS from VPC CIDR"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.main_cidr_block]
   }
 
   egress {
