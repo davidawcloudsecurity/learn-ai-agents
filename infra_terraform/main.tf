@@ -266,10 +266,24 @@ resource "aws_instance" "frontend" {
               NGINX
               ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/
               systemctl restart nginx
+              apt update -y
+              apt install -y git curl
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              apt install -y nodejs
               cd /opt
-              git clone --filter=blob:none --sparse https://github.com/davidawcloudsecurity/learn-claude-code-workshops.git app
+              git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
               cd app
-              git sparse-checkout set ship-your-first-managed-agent
+              npm install
+              npm install -g pm2
+              cd /opt
+              curl -LO https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-x64.tar.gz
+              tar -xzf openvscode-server-*.gz
+              cd openvscode-server-v1.109.5-linux-x64
+              cd bin
+              export PATH="$(pwd):$PATH"
+              echo "export PATH=\"$(pwd):\$PATH\"" >> ~/.bashrc
+              source ~/.bashrc
+              nohup openvscode-server --host 0.0.0.0 --without-connection-token > vscode.log &
               EOF
 
   tags = {
@@ -300,10 +314,8 @@ resource "aws_instance" "backend" {
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               apt install -y nodejs
               cd /opt
-              git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
-              cd app
-              npm install
-              npm install -g pm2
+              curl -fsSL https://ollama.com/install.sh | sh
+              ollama run smollm:1.7b              
               EOF
 
   tags = {
