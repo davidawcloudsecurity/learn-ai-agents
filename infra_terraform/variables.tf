@@ -5,9 +5,9 @@ variable "create_vpc" {
 }
 
 variable "main_cidr_block" {
-  description = "CIDR block for the VPC"
+  description = "CIDR block for the VPC (Class B - 172.168.0.0/16)"
   type        = string
-  default     = "172.16.0.0/16"
+  default     = "172.168.0.0/16"
 }
 
 variable "project_tag" {
@@ -19,13 +19,7 @@ variable "project_tag" {
 variable "public_subnet_cidrs" {
   description = "CIDR blocks for public subnets"
   type        = list(string)
-  default     = ["172.16.1.0/24", "172.16.2.0/24"]
-}
-
-variable "private_subnet_cidrs" {
-  description = "CIDR blocks for private subnets"
-  type        = list(string)
-  default     = ["172.16.10.0/24", "172.16.11.0/24"]
+  default     = ["172.168.1.0/24", "172.168.2.0/24"]
 }
 
 variable "azs" {
