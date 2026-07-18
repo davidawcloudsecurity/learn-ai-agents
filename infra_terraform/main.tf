@@ -109,34 +109,16 @@ resource "aws_security_group" "ec2_sg" {
   description = "Shared security group for frontend and backend EC2 instances"
   vpc_id      = aws_vpc.main[0].id
 
-  # Allow HTTP from ALB
+  # Allow VS Code Server port (3000) from ALB
   ingress {
-    description     = "HTTP from ALB"
-    from_port       = 80
-    to_port         = 80
+    description     = "VS Code Server port 3000 from ALB"
+    from_port       = 3000
+    to_port         = 3000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg[0].id]
   }
 
-  # Allow app port (8501 - Streamlit) from ALB
-  ingress {
-    description     = "App port 8501 from ALB"
-    from_port       = 8501
-    to_port         = 8501
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg[0].id]
-  }
-
-  # Allow backend port (8000) from ALB
-  ingress {
-    description     = "Backend port 8000 from ALB"
-    from_port       = 8000
-    to_port         = 8000
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg[0].id]
-  }
-
-  # Allow all traffic from within VPC CIDR
+  # Allow all traffic from within VPC CIDR (frontend → backend Ollama on 11434)
   ingress {
     description = "All traffic from VPC CIDR"
     from_port   = 0
@@ -241,49 +223,34 @@ resource "aws_instance" "frontend" {
 
   user_data = <<-EOF
               #!/bin/bash
-              apt update
-              apt install -y nginx git curl
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-              apt install -y nodejs
-              rm /etc/nginx/sites-enabled/default
-              cat > /etc/nginx/sites-available/app <<'NGINX'
-              server {
-                listen 80;
-                root /opt/app/dist;
-                index index.html;
-                location /api/ {
-                  proxy_pass http://localhost:8501;
-                  proxy_read_timeout 300s;
-                  proxy_connect_timeout 75s;
-                  proxy_send_timeout 300s;
-                  proxy_buffering off;
-                  proxy_cache off;
-                }
-                location / {
-                  try_files $uri /index.html;
-                }
-              }
-              NGINX
-              ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/
-              systemctl restart nginx
+              set -e
+
+              # --- System packages ---
               apt update -y
               apt install -y git curl
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+
+              # --- Node.js 20 ---
+              curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
               apt install -y nodejs
+              npm install -g pm2
+
+              # --- Clone application ---
               cd /opt
               git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
-              cd app
+              cd /opt/app
               npm install
-              npm install -g pm2
+
+              # --- OpenVSCode Server (serves directly on port 3000) ---
               cd /opt
               curl -LO https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-x64.tar.gz
-              tar -xzf openvscode-server-*.gz
-              cd openvscode-server-v1.109.5-linux-x64
-              cd bin
-              export PATH="$(pwd):$PATH"
-              echo "export PATH=\"$(pwd):\$PATH\"" >> ~/.bashrc
-              source ~/.bashrc
-              nohup openvscode-server --host 0.0.0.0 --without-connection-token > vscode.log &
+              tar -xzf openvscode-server-v1.109.5-linux-x64.tar.gz
+              rm -f openvscode-server-v1.109.5-linux-x64.tar.gz
+
+              # Start VS Code Server on port 3000 via pm2
+              pm2 start /opt/openvscode-server-v1.109.5-linux-x64/bin/openvscode-server \
+                --name vscode-server -- --host 0.0.0.0 --without-connection-token
+              pm2 save
+              pm2 startup systemd -u root --hp /root
               EOF
 
   tags = {
@@ -309,13 +276,22 @@ resource "aws_instance" "backend" {
 
   user_data = <<-EOF
               #!/bin/bash
-              apt update -y
-              apt install -y git curl
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-              apt install -y nodejs
-              cd /opt
+              set -e
+
+              # --- Install Ollama ---
               curl -fsSL https://ollama.com/install.sh | sh
-              ollama run smollm:1.7b              
+
+              # --- Configure Ollama to listen on all interfaces ---
+              mkdir -p /etc/systemd/system/ollama.service.d
+              cat > /etc/systemd/system/ollama.service.d/override.conf <<'SYSTEMD'
+              [Service]
+              Environment="OLLAMA_HOST=0.0.0.0"
+              SYSTEMD
+              systemctl daemon-reload
+              systemctl restart ollama
+
+              # --- Pull the model (non-interactive) ---
+              ollama pull smollm:1.7b
               EOF
 
   tags = {
@@ -340,11 +316,11 @@ resource "aws_lb" "alb" {
   }
 }
 
-# Target Group - Frontend (port 8501)
+# Target Group - Frontend (port 3000 - VS Code Server directly)
 resource "aws_lb_target_group" "frontend_tg" {
   count    = var.create_vpc ? 1 : 0
   name     = "${var.project_tag}-frontend-tg"
-  port     = 8501
+  port     = 3000
   protocol = "HTTP"
   vpc_id   = aws_vpc.main[0].id
 
@@ -355,34 +331,11 @@ resource "aws_lb_target_group" "frontend_tg" {
     timeout             = 5
     interval            = 30
     path                = "/"
-    matcher             = "200"
+    matcher             = "200,302"
   }
 
   tags = {
     Name = "${var.project_tag}-frontend-tg"
-  }
-}
-
-# Target Group - Backend (port 8000)
-resource "aws_lb_target_group" "backend_tg" {
-  count    = var.create_vpc ? 1 : 0
-  name     = "${var.project_tag}-backend-tg"
-  port     = 8000
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main[0].id
-
-  health_check {
-    enabled             = true
-    healthy_threshold   = 3
-    unhealthy_threshold = 3
-    timeout             = 5
-    interval            = 30
-    path                = "/"
-    matcher             = "200"
-  }
-
-  tags = {
-    Name = "${var.project_tag}-backend-tg"
   }
 }
 
@@ -391,18 +344,10 @@ resource "aws_lb_target_group_attachment" "frontend" {
   count            = var.create_vpc ? 1 : 0
   target_group_arn = aws_lb_target_group.frontend_tg[0].arn
   target_id        = aws_instance.frontend[0].id
-  port             = 8501
+  port             = 3000
 }
 
-# Register Backend EC2 with Target Group
-resource "aws_lb_target_group_attachment" "backend" {
-  count            = var.create_vpc ? 1 : 0
-  target_group_arn = aws_lb_target_group.backend_tg[0].arn
-  target_id        = aws_instance.backend[0].id
-  port             = 8000
-}
-
-# ALB Listener - HTTP (port 80) → Frontend by default
+# ALB Listener - HTTP (port 80) → Frontend VS Code
 resource "aws_lb_listener" "http" {
   count             = var.create_vpc ? 1 : 0
   load_balancer_arn = aws_lb.alb[0].arn
@@ -412,24 +357,6 @@ resource "aws_lb_listener" "http" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.frontend_tg[0].arn
-  }
-}
-
-# ALB Listener Rule - /api/* routes to backend
-resource "aws_lb_listener_rule" "backend_api" {
-  count        = var.create_vpc ? 1 : 0
-  listener_arn = aws_lb_listener.http[0].arn
-  priority     = 100
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.backend_tg[0].arn
-  }
-
-  condition {
-    path_pattern {
-      values = ["/api/*"]
-    }
   }
 }
 
@@ -450,4 +377,9 @@ output "frontend_public_ip" {
 output "backend_public_ip" {
   description = "Backend EC2 public IP"
   value       = var.create_vpc ? aws_instance.backend[0].public_ip : null
+}
+
+output "backend_private_ip" {
+  description = "Backend EC2 private IP (use for Ollama endpoint: http://<this>:11434)"
+  value       = var.create_vpc ? aws_instance.backend[0].private_ip : null
 }
