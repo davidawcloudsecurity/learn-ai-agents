@@ -1,142 +1,148 @@
+# =============================================================================
+# Provider
+# =============================================================================
 
-# Define AWS as the provider with the specified region.
 provider "aws" {
   region = "us-east-1"
 }
 
-# Create an AWS VPC with the specified CIDR block and tags.
-resource "aws_vpc" "demo_main_vpc" {
+# =============================================================================
+# VPC + Networking (Public only, no NAT)
+# =============================================================================
+
+resource "aws_vpc" "main" {
   count                = var.create_vpc ? 1 : 0
   cidr_block           = var.main_cidr_block
   enable_dns_hostnames = true
   enable_dns_support   = true
+
   tags = {
-    Name = var.project_tag
+    Name = "${var.project_tag}-vpc"
   }
 }
 
-# Internet Gateway
-resource "aws_internet_gateway" "demo_igw" {
+resource "aws_internet_gateway" "igw" {
   count  = var.create_vpc ? 1 : 0
-  vpc_id = var.create_vpc ? aws_vpc.demo_main_vpc[0].id : null
+  vpc_id = aws_vpc.main[0].id
+
   tags = {
     Name = "${var.project_tag}-igw"
   }
 }
 
-# Data source for existing VPC (when not creating new one)
-data "aws_vpc" "existing" {
-  count = var.create_vpc ? 0 : 1
-  
-  filter {
-    name   = "tag:Name"
-    values = [var.project_tag]
-  }
-}
-
-resource "aws_subnet" "public_subnet_01" {
+resource "aws_subnet" "public" {
   count                   = var.create_vpc ? length(var.public_subnet_cidrs) : 0
-  vpc_id                  = var.create_vpc ? aws_vpc.demo_main_vpc[0].id : null
+  vpc_id                  = aws_vpc.main[0].id
   cidr_block              = var.public_subnet_cidrs[count.index]
   availability_zone       = var.azs[count.index]
   map_public_ip_on_launch = true
+
   tags = {
-    Name = "${var.project_tag}-pb-sub-01"
+    Name = "${var.project_tag}-public-subnet-${count.index + 1}"
   }
 }
 
-# Data source for existing public subnets
-data "aws_subnets" "existing_public" {
-  count = var.create_vpc ? 0 : 1
-  
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.existing[0].id]
-  }
-  
-  filter {
-    name   = "tag:Name"
-    values = ["${var.project_tag}-pb-sub-01"]
-  }
-}
-
-resource "aws_subnet" "private_subnet_01" {
-  count             = var.create_vpc ? length(var.private_subnet_cidrs) : 0
-  vpc_id            = var.create_vpc ? aws_vpc.demo_main_vpc[0].id : null
-  cidr_block        = var.private_subnet_cidrs[count.index]
-  availability_zone = var.azs[count.index]
-  tags = {
-    Name = "${var.project_tag}-pv-sub-01"
-  }
-}
-
-# Public Route Table
-resource "aws_route_table" "public_rt" {
+resource "aws_route_table" "public" {
   count  = var.create_vpc ? 1 : 0
-  vpc_id = var.create_vpc ? aws_vpc.demo_main_vpc[0].id : null
-  
+  vpc_id = aws_vpc.main[0].id
+
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = var.create_vpc ? aws_internet_gateway.demo_igw[0].id : null
+    gateway_id = aws_internet_gateway.igw[0].id
   }
-  
+
   tags = {
     Name = "${var.project_tag}-public-rt"
   }
 }
 
-# Associate public subnets with public route table
-resource "aws_route_table_association" "public_rta" {
-  count          = var.create_vpc ? length(aws_subnet.public_subnet_01) : 0
-  subnet_id      = aws_subnet.public_subnet_01[count.index].id
-  route_table_id = aws_route_table.public_rt[0].id
+resource "aws_route_table_association" "public" {
+  count          = var.create_vpc ? length(var.public_subnet_cidrs) : 0
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public[0].id
 }
 
-# Security Group for Frontend
-resource "aws_security_group" "frontend_sg" {
+# =============================================================================
+# Security Groups
+# =============================================================================
+
+# ALB Security Group - allows inbound HTTP/HTTPS from anywhere
+resource "aws_security_group" "alb_sg" {
   count       = var.create_vpc ? 1 : 0
-  name        = "${var.project_tag}-frontend-sg"
-  description = "Security group for frontend EC2"
-  vpc_id      = aws_vpc.demo_main_vpc[0].id
+  name        = "${var.project_tag}-alb-sg"
+  description = "Security group for ALB"
+  vpc_id      = aws_vpc.main[0].id
 
   ingress {
+    description = "HTTP from anywhere"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS from anywhere"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_tag}-alb-sg"
+  }
+}
+
+# Shared Security Group for Frontend + Backend EC2
+# Allows traffic from ALB SG and from within VPC CIDR
+resource "aws_security_group" "ec2_sg" {
+  count       = var.create_vpc ? 1 : 0
+  name        = "${var.project_tag}-ec2-sg"
+  description = "Shared security group for frontend and backend EC2 instances"
+  vpc_id      = aws_vpc.main[0].id
+
+  # Allow HTTP from ALB
+  ingress {
+    description     = "HTTP from ALB"
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg[0].id]
   }
 
+  # Allow app port (8501 - Streamlit) from ALB
   ingress {
+    description     = "App port 8501 from ALB"
     from_port       = 8501
     to_port         = 8501
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg[0].id]
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.project_tag}-frontend-sg"
-  }
-}
-
-# Security Group for Backend
-resource "aws_security_group" "backend_sg" {
-  count       = var.create_vpc ? 1 : 0
-  name        = "${var.project_tag}-backend-sg"
-  description = "Security group for backend EC2"
-  vpc_id      = aws_vpc.demo_main_vpc[0].id
-
+  # Allow backend port (8000) from ALB
   ingress {
-    from_port   = 8000
-    to_port     = 8000
-    protocol    = "tcp"
-    cidr_blocks = ["172.16.0.0/16"]
+    description     = "Backend port 8000 from ALB"
+    from_port       = 8000
+    to_port         = 8000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg[0].id]
+  }
+
+  # Allow all traffic from within VPC CIDR
+  ingress {
+    description = "All traffic from VPC CIDR"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [var.main_cidr_block]
   }
 
   egress {
@@ -147,11 +153,14 @@ resource "aws_security_group" "backend_sg" {
   }
 
   tags = {
-    Name = "${var.project_tag}-backend-sg"
+    Name = "${var.project_tag}-ec2-sg"
   }
 }
 
-# IAM Role for EC2 instances
+# =============================================================================
+# IAM Role for EC2 (SSM + Bedrock)
+# =============================================================================
+
 resource "aws_iam_role" "ec2_role" {
   name = "${var.project_tag}-ec2-role"
 
@@ -177,7 +186,6 @@ resource "aws_iam_role_policy_attachment" "ssm_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Bedrock InvokeModel permission for Claude Sonnet
 resource "aws_iam_role_policy" "bedrock_invoke" {
   name = "${var.project_tag}-bedrock-invoke"
   role = aws_iam_role.ec2_role.id
@@ -197,7 +205,10 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
   })
 }
 
-# Get latest Ubuntu AMI
+# =============================================================================
+# AMI
+# =============================================================================
+
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"]
@@ -207,119 +218,18 @@ data "aws_ami" "ubuntu" {
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 }
-/*
-# Backend EC2 Instance
-resource "aws_instance" "backend" {
-  count                  = var.create_vpc ? 1 : 0
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t3.medium" # c6a.2xlarge / g4dn.xlarge
-  subnet_id              = aws_subnet.public_subnet_01[0].id
-  vpc_security_group_ids = [aws_security_group.backend_sg[0].id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
-  root_block_device {
-    volume_size = 30
-    volume_type = "gp3"
-  }
-
-  user_data = <<-EOF
-              #!/bin/bash
-              apt update -y
-              apt install -y git curl
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-              apt install -y nodejs
-              cd /opt
-              git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
-              cd app
-              npm install
-              npm install -g pm2
-              cd /opt
-              npm install -g @anthropic-ai/claude-code              
-              curl -fsSL https://ollama.com/install.sh | sh
-              curl -LO https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-x64.tar.gz
-              tar -xzf openvscode-server-*.gz
-              cd openvscode-server-v1.109.5-linux-x64
-              cd bin
-              export PATH="$(pwd):$PATH"
-              echo "export PATH=\"$(pwd):\$PATH\"" >> ~/.bashrc
-              source ~/.bashrc
-              nohup openvscode-server --host 0.0.0.0 --without-connection-token > vscode.log &
-              EOF
-
-  tags = {
-    Name = "${var.project_tag}-backend"
-  }
-}
-*/
-/*
-# Frontend EC2 Instance
-resource "aws_instance" "frontend" {
-  count                  = var.create_vpc ? 1 : 0
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t3.small"
-  subnet_id              = aws_subnet.public_subnet_01[0].id
-  vpc_security_group_ids = [aws_security_group.frontend_sg[0].id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
-
-  root_block_device {
-    volume_size           = 30
-    volume_type           = "gp3"
-    delete_on_termination = true
-    encrypted             = true
-  }
-
-  user_data = <<-EOF
-              #!/bin/bash
-              apt update
-              apt install -y nginx git curl
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-              apt install -y nodejs
-              cd /opt
-              git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
-              cd app
-              npm install
-              npm run build
-              rm /etc/nginx/sites-enabled/default
-              cat > /etc/nginx/sites-available/app <<'NGINX'
-              server {
-                listen 80;
-                root /opt/app/dist;
-                index index.html;
-                location /api/ {
-                  proxy_pass http://localhost:8000;
-                  # Increase timeouts for slow LLM responses
-                  proxy_read_timeout 300s;      # 5 minutes
-                  proxy_connect_timeout 75s;
-                  proxy_send_timeout 300s;
-                  
-                  # Important for streaming
-                  proxy_buffering off;
-                  proxy_cache off;
-                }
-                location / {
-                  try_files $uri /index.html;
-                }
-              }
-              NGINX
-              ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/
-              systemctl restart nginx
-              curl -fsSL https://ollama.com/install.sh | sh
-              ollama run smollm:1.7b
-              EOF
-
-  tags = {
-    Name = "${var.project_tag}-frontend"
-  }
-}
-*/
+# =============================================================================
+# EC2 Instances (both in public subnets, same SG)
+# =============================================================================
 
 # Frontend EC2 Instance
 resource "aws_instance" "frontend" {
   count                  = var.create_vpc ? 1 : 0
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = "t3.medium"
-  subnet_id              = aws_subnet.public_subnet_01[0].id
-  vpc_security_group_ids = [aws_security_group.frontend_sg[0].id]
+  subnet_id              = aws_subnet.public[0].id
+  vpc_security_group_ids = [aws_security_group.ec2_sg[0].id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
   root_block_device {
@@ -343,12 +253,9 @@ resource "aws_instance" "frontend" {
                 index index.html;
                 location /api/ {
                   proxy_pass http://localhost:8501;
-                  # Increase timeouts for slow LLM responses
-                  proxy_read_timeout 300s;      # 5 minutes
+                  proxy_read_timeout 300s;
                   proxy_connect_timeout 75s;
                   proxy_send_timeout 300s;
-                  
-                  # Important for streaming
                   proxy_buffering off;
                   proxy_cache off;
                 }
@@ -370,64 +277,64 @@ resource "aws_instance" "frontend" {
   }
 }
 
-# =============================================================================
-# ALB + CloudFront for Frontend
-# =============================================================================
+# Backend EC2 Instance
+resource "aws_instance" "backend" {
+  count                  = var.create_vpc ? 1 : 0
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.public[1].id
+  vpc_security_group_ids = [aws_security_group.ec2_sg[0].id]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
-# Security Group for ALB
-resource "aws_security_group" "alb_sg" {
-  count       = var.create_vpc ? 1 : 0
-  name        = "${var.project_tag}-alb-sg"
-  description = "Security group for ALB"
-  vpc_id      = aws_vpc.demo_main_vpc[0].id
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["172.16.0.0/16"]
+  root_block_device {
+    volume_size           = 30
+    volume_type           = "gp3"
+    delete_on_termination = true
+    encrypted             = true
   }
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["172.16.0.0/16"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  user_data = <<-EOF
+              #!/bin/bash
+              apt update -y
+              apt install -y git curl
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              apt install -y nodejs
+              cd /opt
+              git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
+              cd app
+              npm install
+              npm install -g pm2
+              EOF
 
   tags = {
-    Name = "${var.project_tag}-alb-sg"
+    Name = "${var.project_tag}-backend"
   }
 }
 
+# =============================================================================
 # Application Load Balancer
-resource "aws_lb" "frontend_alb" {
+# =============================================================================
+
+resource "aws_lb" "alb" {
   count              = var.create_vpc ? 1 : 0
-  name               = "${var.project_tag}-frontend-alb"
+  name               = "${var.project_tag}-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg[0].id]
-  subnets            = aws_subnet.public_subnet_01[*].id
+  subnets            = aws_subnet.public[*].id
 
   tags = {
-    Name = "${var.project_tag}-frontend-alb"
+    Name = "${var.project_tag}-alb"
   }
 }
 
-# Target Group for Frontend EC2
+# Target Group - Frontend (port 8501)
 resource "aws_lb_target_group" "frontend_tg" {
   count    = var.create_vpc ? 1 : 0
   name     = "${var.project_tag}-frontend-tg"
   port     = 8501
   protocol = "HTTP"
-  vpc_id   = aws_vpc.demo_main_vpc[0].id
+  vpc_id   = aws_vpc.main[0].id
 
   health_check {
     enabled             = true
@@ -444,18 +351,49 @@ resource "aws_lb_target_group" "frontend_tg" {
   }
 }
 
+# Target Group - Backend (port 8000)
+resource "aws_lb_target_group" "backend_tg" {
+  count    = var.create_vpc ? 1 : 0
+  name     = "${var.project_tag}-backend-tg"
+  port     = 8000
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main[0].id
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    path                = "/"
+    matcher             = "200"
+  }
+
+  tags = {
+    Name = "${var.project_tag}-backend-tg"
+  }
+}
+
 # Register Frontend EC2 with Target Group
-resource "aws_lb_target_group_attachment" "frontend_tg_attachment" {
+resource "aws_lb_target_group_attachment" "frontend" {
   count            = var.create_vpc ? 1 : 0
   target_group_arn = aws_lb_target_group.frontend_tg[0].arn
   target_id        = aws_instance.frontend[0].id
   port             = 8501
 }
 
-# ALB Listener (HTTP)
-resource "aws_lb_listener" "frontend_http" {
+# Register Backend EC2 with Target Group
+resource "aws_lb_target_group_attachment" "backend" {
+  count            = var.create_vpc ? 1 : 0
+  target_group_arn = aws_lb_target_group.backend_tg[0].arn
+  target_id        = aws_instance.backend[0].id
+  port             = 8000
+}
+
+# ALB Listener - HTTP (port 80) → Frontend by default
+resource "aws_lb_listener" "http" {
   count             = var.create_vpc ? 1 : 0
-  load_balancer_arn = aws_lb.frontend_alb[0].arn
+  load_balancer_arn = aws_lb.alb[0].arn
   port              = 80
   protocol          = "HTTP"
 
@@ -465,100 +403,21 @@ resource "aws_lb_listener" "frontend_http" {
   }
 }
 
-# CloudFront Distribution
-resource "aws_cloudfront_distribution" "frontend_cdn" {
-  count   = var.create_vpc ? 1 : 0
-  enabled = true
-  comment = "${var.project_tag} frontend distribution"
+# ALB Listener Rule - /api/* routes to backend
+resource "aws_lb_listener_rule" "backend_api" {
+  count        = var.create_vpc ? 1 : 0
+  listener_arn = aws_lb_listener.http[0].arn
+  priority     = 100
 
-  origin {
-    domain_name = aws_lb.frontend_alb[0].dns_name
-    origin_id   = "alb-frontend"
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.backend_tg[0].arn
+  }
 
-    custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "http-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
+  condition {
+    path_pattern {
+      values = ["/api/*"]
     }
-  }
-
-  default_cache_behavior {
-    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "alb-frontend"
-    viewer_protocol_policy = "redirect-to-https"
-
-    forwarded_values {
-      query_string = true
-      headers      = ["Origin", "Authorization"]
-
-      cookies {
-        forward = "all"
-      }
-    }
-
-    min_ttl     = 0
-    default_ttl = 0
-    max_ttl     = 0
-  }
-
-  # Cache behavior for /api/* - no caching, pass everything through
-  ordered_cache_behavior {
-    path_pattern           = "/api/*"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "alb-frontend"
-    viewer_protocol_policy = "redirect-to-https"
-
-    forwarded_values {
-      query_string = true
-      headers      = ["*"]
-
-      cookies {
-        forward = "all"
-      }
-    }
-
-    min_ttl     = 0
-    default_ttl = 0
-    max_ttl     = 0
-  }
-
-  # Cache behavior for static assets
-  ordered_cache_behavior {
-    path_pattern           = "/assets/*"
-    allowed_methods        = ["GET", "HEAD"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "alb-frontend"
-    viewer_protocol_policy = "redirect-to-https"
-
-    forwarded_values {
-      query_string = false
-
-      cookies {
-        forward = "none"
-      }
-    }
-
-    min_ttl     = 0
-    default_ttl = 86400
-    max_ttl     = 31536000
-    compress    = true
-  }
-
-  restrictions {
-    geo_restriction {
-      restriction_type = "none"
-    }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
-
-  tags = {
-    Name = "${var.project_tag}-frontend-cdn"
   }
 }
 
@@ -566,23 +425,17 @@ resource "aws_cloudfront_distribution" "frontend_cdn" {
 # Outputs
 # =============================================================================
 
-output "cloudfront_domain_name" {
-  description = "CloudFront distribution domain name"
-  value       = var.create_vpc ? aws_cloudfront_distribution.frontend_cdn[0].domain_name : null
-}
-
 output "alb_dns_name" {
   description = "ALB DNS name"
-  value       = var.create_vpc ? aws_lb.frontend_alb[0].dns_name : null
+  value       = var.create_vpc ? aws_lb.alb[0].dns_name : null
 }
 
-output "frontend_instance_public_ip" {
+output "frontend_public_ip" {
   description = "Frontend EC2 public IP"
   value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
 }
-/*
-output "backend_instance_public_ip" {
+
+output "backend_public_ip" {
   description = "Backend EC2 public IP"
   value       = var.create_vpc ? aws_instance.backend[0].public_ip : null
 }
-*/
