@@ -181,7 +181,10 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
         "bedrock:InvokeModelWithResponseStream"
       ]
       Resource = [
-        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0",
+        "arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:*:762595429056:inference-profile/us.amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:*:762595429056:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0"
       ]
     }]
   })
@@ -229,16 +232,7 @@ resource "aws_instance" "frontend" {
               apt update -y
               apt install -y git curl
 
-              # --- Node.js 20 ---
-              curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-              apt install -y nodejs
               npm install -g pm2
-
-              # --- Clone application ---
-              cd /opt
-              git clone https://github.com/davidawcloudsecurity/learn-lovable-llm.git app
-              cd /opt/app
-              npm install
 
               # --- OpenVSCode Server (serves directly on port 3000) ---
               cd /opt
