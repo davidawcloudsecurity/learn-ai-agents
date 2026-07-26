@@ -243,7 +243,9 @@ resource "aws_instance" "frontend" {
 
               # Start VS Code Server on port 3000 via pm2
               pm2 start /opt/openvscode-server-v1.109.5-linux-x64/bin/openvscode-server \
-                --name vscode-server -- --host 0.0.0.0 --without-connection-token
+                --name vscode-server \
+                --interpreter bash \
+                -- --host 0.0.0.0 --without-connection-token
               pm2 save
               pm2 startup systemd -u root --hp /root
               EOF
