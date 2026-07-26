@@ -231,7 +231,8 @@ resource "aws_instance" "frontend" {
               # --- System packages ---
               apt update -y
               apt install -y git curl
-
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              apt install -y nodejs
               npm install -g pm2
 
               # --- OpenVSCode Server (serves directly on port 3000) ---
