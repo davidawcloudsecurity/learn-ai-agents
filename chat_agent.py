@@ -25,7 +25,7 @@ import json
 import requests
 
 # Where the Ollama server lives. Override with the OLLAMA_HOST env var.
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://demo-project-alb-1989896788.us-east-1.elb.amazonaws.com")
 MODEL = os.environ.get("OLLAMA_MODEL", "smollm:1.7b")
 
 # Connect/read timeout in seconds (model generation can be slow on t3.medium).

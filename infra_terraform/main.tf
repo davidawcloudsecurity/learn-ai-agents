@@ -288,7 +288,7 @@ resource "aws_instance" "backend" {
               systemctl restart ollama
 
               # --- Pull the model (non-interactive) ---
-              ollama pull smollm:1.7b
+              ollama run smollm:1.7b
               EOF
 
   tags = {
