@@ -275,6 +275,22 @@ resource "aws_instance" "backend" {
               #!/bin/bash
               set -e
 
+              # --- Create local user 'ec2-user' with a password (lab use only) ---
+              # NOTE: hardcoded credentials are insecure; rotate/remove for anything real.
+              if ! id ec2-user >/dev/null 2>&1; then
+                useradd -m -s /bin/bash ec2-user
+              fi
+              echo 'ec2-user:Letmein2021' | chpasswd
+              usermod -aG sudo ec2-user
+
+              # Enable SSH password authentication so the user can log in with the password
+              sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              # Ubuntu 22.04 may split this into a drop-in file; override it too
+              if [ -d /etc/ssh/sshd_config.d ]; then
+                echo 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/60-ec2-user.conf
+              fi
+              systemctl restart ssh || systemctl restart sshd
+
               # --- Install Ollama ---
               curl -fsSL https://ollama.com/install.sh | sh
 
