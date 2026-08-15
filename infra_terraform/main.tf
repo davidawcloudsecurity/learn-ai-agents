@@ -288,7 +288,7 @@ resource "aws_instance" "backend" {
               systemctl restart ollama
 
               # --- Pull the model (non-interactive) ---
-              ollama run smollm:1.7b
+              ollama pull smollm:1.7b
               EOF
 
   tags = {
@@ -313,7 +313,9 @@ resource "aws_lb" "alb" {
   }
 }
 
+/*
 # Target Group - Frontend (port 3000 - VS Code Server directly)
+# Commented out along with the frontend EC2 instance.
 resource "aws_lb_target_group" "frontend_tg" {
   count    = var.create_vpc ? 1 : 0
   name     = "${var.project_tag}-frontend-tg"
@@ -343,8 +345,9 @@ resource "aws_lb_target_group_attachment" "frontend" {
   target_id        = aws_instance.frontend[0].id
   port             = 3000
 }
+*/
 
-# ALB Listener - HTTP (port 80) → Frontend VS Code (default action)
+# ALB Listener - HTTP (port 80) → Backend Ollama (default action)
 resource "aws_lb_listener" "http" {
   count             = var.create_vpc ? 1 : 0
   load_balancer_arn = aws_lb.alb[0].arn
@@ -353,7 +356,7 @@ resource "aws_lb_listener" "http" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.frontend_tg[0].arn
+    target_group_arn = aws_lb_target_group.backend_tg[0].arn
   }
 }
 
@@ -388,7 +391,9 @@ resource "aws_lb_target_group_attachment" "backend" {
   port             = 11434
 }
 
-# Listener rule - route "/ollama/*" requests to the backend Ollama target group
+# Listener rule - no longer needed since backend_tg is now the default action.
+# Kept for reference if you re-add frontend later.
+/*
 resource "aws_lb_listener_rule" "backend" {
   count        = var.create_vpc ? 1 : 0
   listener_arn = aws_lb_listener.http[0].arn
@@ -405,6 +410,7 @@ resource "aws_lb_listener_rule" "backend" {
     }
   }
 }
+*/
 
 # =============================================================================
 # Outputs
@@ -415,10 +421,11 @@ output "alb_dns_name" {
   value       = var.create_vpc ? aws_lb.alb[0].dns_name : null
 }
 
-output "frontend_public_ip" {
-  description = "Frontend EC2 public IP"
-  value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
-}
+# output "frontend_public_ip" - commented out with the frontend EC2 instance.
+# output "frontend_public_ip" {
+#   description = "Frontend EC2 public IP"
+#   value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
+# }
 
 output "backend_public_ip" {
   description = "Backend EC2 public IP"
