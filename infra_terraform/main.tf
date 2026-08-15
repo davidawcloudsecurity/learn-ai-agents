@@ -207,7 +207,7 @@ data "aws_ami" "ubuntu" {
 # =============================================================================
 # EC2 Instances (both in public subnets, same SG)
 # =============================================================================
-
+/*
 # Frontend EC2 Instance
 resource "aws_instance" "frontend" {
   count                  = var.create_vpc ? 1 : 0
@@ -254,7 +254,7 @@ resource "aws_instance" "frontend" {
     Name = "${var.project_tag}-frontend"
   }
 }
-
+*/
 # Backend EC2 Instance
 resource "aws_instance" "backend" {
   count                  = var.create_vpc ? 1 : 0
@@ -313,7 +313,9 @@ resource "aws_lb" "alb" {
   }
 }
 
+/*
 # Target Group - Frontend (port 3000 - VS Code Server directly)
+# Commented out along with the frontend EC2 instance.
 resource "aws_lb_target_group" "frontend_tg" {
   count    = var.create_vpc ? 1 : 0
   name     = "${var.project_tag}-frontend-tg"
@@ -343,8 +345,9 @@ resource "aws_lb_target_group_attachment" "frontend" {
   target_id        = aws_instance.frontend[0].id
   port             = 3000
 }
+*/
 
-# ALB Listener - HTTP (port 80) → Frontend VS Code
+# ALB Listener - HTTP (port 80) → Backend Ollama (default action)
 resource "aws_lb_listener" "http" {
   count             = var.create_vpc ? 1 : 0
   load_balancer_arn = aws_lb.alb[0].arn
@@ -353,9 +356,61 @@ resource "aws_lb_listener" "http" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.frontend_tg[0].arn
+    target_group_arn = aws_lb_target_group.backend_tg[0].arn
   }
 }
+
+# Target Group - Backend (port 11434 - Ollama API)
+resource "aws_lb_target_group" "backend_tg" {
+  count    = var.create_vpc ? 1 : 0
+  name     = "${var.project_tag}-backend-tg"
+  port     = 11434
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main[0].id
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    path                = "/"
+    matcher             = "200"
+  }
+
+  tags = {
+    Name = "${var.project_tag}-backend-tg"
+  }
+}
+
+# Register Backend EC2 with Target Group
+resource "aws_lb_target_group_attachment" "backend" {
+  count            = var.create_vpc ? 1 : 0
+  target_group_arn = aws_lb_target_group.backend_tg[0].arn
+  target_id        = aws_instance.backend[0].id
+  port             = 11434
+}
+
+# Listener rule - no longer needed since backend_tg is now the default action.
+# Kept for reference if you re-add frontend later.
+/*
+resource "aws_lb_listener_rule" "backend" {
+  count        = var.create_vpc ? 1 : 0
+  listener_arn = aws_lb_listener.http[0].arn
+  priority     = 100
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.backend_tg[0].arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/ollama", "/ollama/*", "/api/*"]
+    }
+  }
+}
+*/
 
 # =============================================================================
 # Outputs
@@ -366,10 +421,11 @@ output "alb_dns_name" {
   value       = var.create_vpc ? aws_lb.alb[0].dns_name : null
 }
 
-output "frontend_public_ip" {
-  description = "Frontend EC2 public IP"
-  value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
-}
+# output "frontend_public_ip" - commented out with the frontend EC2 instance.
+# output "frontend_public_ip" {
+#   description = "Frontend EC2 public IP"
+#   value       = var.create_vpc ? aws_instance.frontend[0].public_ip : null
+# }
 
 output "backend_public_ip" {
   description = "Backend EC2 public IP"
@@ -379,4 +435,9 @@ output "backend_public_ip" {
 output "backend_private_ip" {
   description = "Backend EC2 private IP (use for Ollama endpoint: http://<this>:11434)"
   value       = var.create_vpc ? aws_instance.backend[0].private_ip : null
+}
+
+output "backend_target_group_arn" {
+  description = "ARN of the backend (Ollama) target group"
+  value       = var.create_vpc ? aws_lb_target_group.backend_tg[0].arn : null
 }
