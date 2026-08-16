@@ -275,6 +275,11 @@ resource "aws_instance" "backend" {
               #!/bin/bash
               set -e
 
+              # cloud-init runs as root but does NOT set $HOME. The ollama CLI
+              # needs it to locate ~/.ollama, otherwise it panics:
+              #   "panic: $HOME is not defined"
+              export HOME=/root
+
               # --- Create local user 'ec2-user' with a password (lab use only) ---
               # NOTE: hardcoded credentials are insecure; rotate/remove for anything real.
               if ! id ec2-user >/dev/null 2>&1; then
@@ -303,8 +308,19 @@ resource "aws_instance" "backend" {
               systemctl daemon-reload
               systemctl restart ollama
 
+              # --- Wait for Ollama to actually be ready before pulling ---
+              echo "Waiting for Ollama to become ready..."
+              for i in $(seq 1 30); do
+                if curl -fs http://localhost:11434/api/tags >/dev/null 2>&1; then
+                  echo "Ollama is up."
+                  break
+                fi
+                echo "  not ready yet, retrying ($i/30)..."
+                sleep 2
+              done              
+
               # --- Pull the model (non-interactive) ---
-              ollama run smollm:1.7b
+              ollama pull qwen2.5:1.5b
               EOF
 
   tags = {
