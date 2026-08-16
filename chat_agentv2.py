@@ -29,7 +29,8 @@ at this. For the --tools demo, use something like qwen2.5:3b or llama3.1:8b:
 import os
 import sys
 import json
-import atexit
+import time
+import socket
 
 import requests
 
@@ -91,7 +92,8 @@ def calculator(expression: str) -> str:
 
 # Chrome remote-debugging endpoint. Start Chrome first with:
 #   chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\temp\chrome_debug_profile
-# so the browser (and your logged-in session) persists across runs.
+# so the browser (and your logged-in session) persists across runs. Selenium
+# attaches to this via debuggerAddress.
 CDP_URL = "http://127.0.0.1:9222"
 
 # The Chrome profile directory used with --user-data-dir. Used by
@@ -140,146 +142,335 @@ def setup_teams_no_prompt(user_data_dir: str = CHROME_USER_DATA_DIR) -> str:
     except Exception as e:  # noqa: BLE001
         return f"Failed to update {prefs_path}: {e}"
 
-# Keep Playwright objects alive at module scope so a freshly launched browser
-# isn't garbage-collected (and closed) after open_url() returns.
-_PW = None
-_BROWSER = None
+# Reuse a single Selenium Chrome driver across tool calls.
+# Selenium is pure Python (no Node driver), so there is no EPIPE crash on exit.
+_DRIVER = None
 
 
-def _shutdown_browser() -> None:
-    """Cleanly tear down Playwright on process exit.
+def _get_driver():
+    """Return a Selenium Chrome driver, reusing one across tool calls.
 
-    Without this, the script exits while Chrome is still emitting events,
-    and Playwright's Node driver crashes with 'EPIPE: broken pipe'.
-
-    For a browser we connected to over CDP, close() just DISCONNECTS
-    Playwright and leaves your Chrome (and the Teams meeting) running.
-    For a browser we launched ourselves, close() shuts it down.
-    """
-    global _PW, _BROWSER
-    try:
-        if _BROWSER is not None:
-            _BROWSER.close()
-    except Exception:
-        pass
-    try:
-        if _PW is not None:
-            _PW.stop()
-    except Exception:
-        pass
-    _BROWSER = None
-    _PW = None
-
-
-atexit.register(_shutdown_browser)
-
-
-def _new_page():
-    """Return a fresh Playwright page, reusing one Chrome across tool calls.
-
-    Connects to an existing Chrome started with --remote-debugging-port=9222
+    Attaches to an existing Chrome started with --remote-debugging-port=9222
     (so your logged-in session persists); if none is running, launches a new
-    non-headless Chrome. Raises on failure; callers handle the exception.
+    Chrome using CHROME_USER_DATA_DIR. Raises on failure; callers handle it.
     """
-    global _PW, _BROWSER
-    from playwright.sync_api import sync_playwright
+    global _DRIVER
+    if _DRIVER is not None:
+        return _DRIVER
 
-    if _PW is None:
-        _PW = sync_playwright().start()
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
 
-    if _BROWSER is None:
-        try:
-            _BROWSER = _PW.chromium.connect_over_cdp(CDP_URL)
-            print(f"  [browser] connected to existing Chrome on {CDP_URL}")
-        except Exception:
-            _BROWSER = _PW.chromium.launch(headless=False, channel="chrome")
-            print("  [browser] launched a new Chrome window")
+    # Is a Chrome already listening on the debug port?
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    chrome_running = sock.connect_ex(("127.0.0.1", 9222)) == 0
+    sock.close()
 
-    context = _BROWSER.contexts[0] if _BROWSER.contexts else _BROWSER.new_context()
-    return context.new_page()
+    options = Options()
+    if chrome_running:
+        options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+        _DRIVER = webdriver.Chrome(options=options)
+        print("  [browser] attached to existing Chrome on 127.0.0.1:9222")
+    else:
+        options.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
+        options.add_experimental_option("detach", True)  # keep Chrome open on exit
+        _DRIVER = webdriver.Chrome(options=options)
+        print("  [browser] launched a new Chrome window")
+
+    return _DRIVER
 
 
 def open_url(url: str) -> str:
-    """Open a URL in a real Chrome browser via Playwright.
+    """Open a URL in a real Chrome browser via Selenium (new tab).
 
     Runs on whatever machine executes this script, NOT on the Ollama backend.
     """
     if not url.startswith(("http://", "https://")):
         return f"Refused to open non-http(s) URL: {url}"
     try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
+        from selenium import webdriver  # noqa: F401
     except ImportError:
-        return (
-            "Playwright is not installed. Run:\n"
-            "  pip install playwright\n"
-            "  playwright install chromium"
-        )
+        return "Selenium is not installed. Run:\n  pip install selenium"
     try:
-        page = _new_page()
-        page.goto(url, wait_until="domcontentloaded")
-        return f"Opened {url} (page title: {page.title()!r})"
+        driver = _get_driver()
+        # Open in a new tab so we don't disturb existing tabs.
+        driver.switch_to.new_window("tab")
+        driver.get(url)
+        return f"Opened {url} (page title: {driver.title!r})"
     except Exception as e:  # noqa: BLE001
         return f"Failed to open {url} in browser: {e}"
 
 
 def join_teams(url: str) -> str:
-    """Open a Microsoft Teams meeting link and join in the browser.
+    """Open a Microsoft Teams meeting link and join in the browser via Selenium.
 
     The Teams launcher tries to open the desktop app, which makes Chrome show a
     native "Open Microsoft Teams?" popup. That popup is browser chrome, not page
-    DOM, so we can't click its Cancel button. Instead we click the launcher's own
+    DOM, so it can't be clicked. Instead we click the launcher's own
     "Continue on this browser" button, which loads the Teams web client.
 
-    To stop the native popup appearing at all, launch Chrome with a profile that
-    excludes the msteams scheme (see notes in the chat reply).
+    To stop the native popup appearing at all, run once (Chrome closed):
+        python chat_agentv2.py --setup-teams
     """
     if not url.startswith(("http://", "https://")):
         return f"Refused to open non-http(s) URL: {url}"
     try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
     except ImportError:
-        return (
-            "Playwright is not installed. Run:\n"
-            "  pip install playwright\n"
-            "  playwright install chromium"
-        )
+        return "Selenium is not installed. Run:\n  pip install selenium"
 
     try:
-        page = _new_page()
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)  # give the launcher time to render
+        driver = _get_driver()
+        driver.switch_to.new_window("tab")
+        driver.get(url)
 
-        # The launcher button may live in the main page OR inside an iframe,
-        # so search every frame. NOTE: if the native "Open Microsoft Teams?"
-        # popup is showing, it is tab-modal and blocks these clicks - run
-        # 'python chat_agent.py --setup-teams' once to disable that popup.
-        selectors = [
-            "button:has-text('Continue on this browser')",
-            "text=Continue on this browser",
-            "text=Join on the web instead",
-            "[data-tid='joinOnWeb']",
+        wait = WebDriverWait(driver, 15)
+
+        # XPaths for the launcher's web-join controls. The button may sit inside
+        # an iframe, so we try the top document first, then each frame.
+        xpaths = [
+            "//button[contains(., 'Continue on this browser')]",
+            "//*[contains(text(), 'Continue on this browser')]",
+            "//*[contains(text(), 'Join on the web instead')]",
+            "//*[@data-tid='joinOnWeb']",
         ]
-        for frame in page.frames:
-            for sel in selectors:
+
+        def try_click_in_current_context():
+            for xp in xpaths:
                 try:
-                    btn = frame.locator(sel).first
-                    btn.wait_for(state="visible", timeout=3000)
-                    btn.click()
-                    page.wait_for_timeout(2000)  # let the web client settle
-                    return f"Clicked '{sel}' - joining Teams in the browser."
+                    el = wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+                    el.click()
+                    return xp
                 except Exception:
                     continue
+            return None
+
+        # 1) Try the main document.
+        clicked = try_click_in_current_context()
+
+        # 2) Fall back to searching each iframe.
+        if not clicked:
+            frames = driver.find_elements(By.TAG_NAME, "iframe")
+            for frame in frames:
+                try:
+                    driver.switch_to.frame(frame)
+                    clicked = try_click_in_current_context()
+                finally:
+                    driver.switch_to.default_content()
+                if clicked:
+                    break
+
+        if clicked:
+            return f"Clicked '{clicked}' - joining Teams in the browser."
 
         return (
             "Opened the Teams launcher but couldn't click "
             "'Continue on this browser'. The native 'Open Microsoft Teams?' "
             "popup is almost certainly blocking input. Run this once "
             "(with that Chrome closed):\n"
-            "  python chat_agent.py --setup-teams\n"
+            "  python chat_agentv2.py --setup-teams\n"
             "then reopen Chrome and try again."
         )
     except Exception as e:  # noqa: BLE001
         return f"Failed to join Teams meeting: {e}"
+
+
+def _switch_to_teams_tab(driver) -> bool:
+    """Point the driver at the Teams tab. Returns True if found."""
+    for handle in driver.window_handles:
+        try:
+            driver.switch_to.window(handle)
+            if "teams.microsoft.com" in (driver.current_url or ""):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def read_teams_chat(limit: int = 20) -> str:
+    """Read the most recent messages from the open Teams meeting chat pane.
+
+    Uses the stable data-tid hooks in the Teams web DOM (not the hashed
+    fui-* classes, which change between builds).
+    """
+    try:
+        from selenium.webdriver.common.by import By
+    except ImportError:
+        return "Selenium is not installed. Run:\n  pip install selenium"
+
+    try:
+        driver = _get_driver()
+        if not _switch_to_teams_tab(driver):
+            return "No Teams tab is open. Join a meeting first with join_teams."
+
+        items = driver.find_elements(By.CSS_SELECTOR, "[data-tid='chat-pane-item']")
+        if not items:
+            return "No chat messages found (chat pane may still be loading)."
+
+        lines = []
+        for item in items[-limit:]:
+            text = " ".join(item.text.split())  # collapse whitespace/newlines
+            if text:
+                lines.append(text)
+
+        return "\n".join(lines) if lines else "Chat pane is empty."
+    except Exception as e:  # noqa: BLE001
+        return f"Failed to read Teams chat: {e}"
+
+
+def send_teams_message(message: str) -> str:
+    """Type a message into the Teams meeting chat and send it."""
+    try:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+    except ImportError:
+        return "Selenium is not installed. Run:\n  pip install selenium"
+
+    if not message.strip():
+        return "Refused to send an empty message."
+
+    try:
+        driver = _get_driver()
+        if not _switch_to_teams_tab(driver):
+            return "No Teams tab is open. Join a meeting first with join_teams."
+
+        wait = WebDriverWait(driver, 15)
+
+        # The compose box is a contenteditable CKEditor div.
+        box = wait.until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "div[data-tid='ckeditor'][contenteditable='true']")
+            )
+        )
+        box.click()
+        box.send_keys(message)
+
+        # Prefer the explicit Send button; fall back to Ctrl+Enter.
+        try:
+            send_btn = wait.until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, "button[data-tid='newMessageCommands-send']")
+                )
+            )
+            send_btn.click()
+        except Exception:
+            from selenium.webdriver.common.keys import Keys
+
+            box.send_keys(Keys.CONTROL, Keys.ENTER)
+
+        return f"Sent message to Teams chat: {message!r}"
+    except Exception as e:  # noqa: BLE001
+        return f"Failed to send Teams message: {e}"
+
+
+# System/control lines in the Teams chat we should NOT reply to.
+_SYSTEM_MARKERS = (
+    "joined the conversation",
+    "left the conversation",
+    "meeting started",
+    "meeting ended",
+    "chat has been turned on",
+    "recording",
+    "transcription",
+    "today",
+    "yesterday",
+)
+
+
+def _is_system_line(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _SYSTEM_MARKERS)
+
+
+def _latest_chat_message() -> str | None:
+    """Return the collapsed text of the last message in the Teams chat pane."""
+    from selenium.webdriver.common.by import By
+
+    driver = _get_driver()
+    items = driver.find_elements(By.CSS_SELECTOR, "[data-tid='chat-pane-item']")
+    if not items:
+        return None
+    return " ".join(items[-1].text.split()) or None
+
+
+CONVERSE_SYSTEM_PROMPT = (
+    "You are participating in a Microsoft Teams meeting chat on behalf of the user. "
+    "Reply briefly and naturally (1-2 sentences) to the most recent message. "
+    "Do not narrate your actions or mention that you are an AI."
+)
+
+
+def converse_teams(poll_seconds: int = 3) -> None:
+    """Autonomously watch the Teams chat and reply until someone says 'bye'.
+
+    Runs with no timeout: polls the chat every `poll_seconds`, and for each new
+    incoming message (ignoring system/control lines and our own messages) it
+    asks the model for a reply and sends it. Stops when an incoming message
+    contains 'bye'.
+    """
+    try:
+        from selenium.webdriver.common.by import By  # noqa: F401
+    except ImportError:
+        print("Selenium is not installed. Run:\n  pip install selenium")
+        return
+
+    driver = _get_driver()
+    if not _switch_to_teams_tab(driver):
+        print("No Teams tab is open. Join a meeting first (join_teams).")
+        return
+
+    print(f"[converse] watching Teams chat every {poll_seconds}s. "
+          "Say 'bye' in the chat to stop. Ctrl-C to abort.\n")
+
+    messages: list = [{"role": "system", "content": CONVERSE_SYSTEM_PROMPT}]
+    last_processed = None
+    last_sent = None
+
+    try:
+        while True:
+            latest = _latest_chat_message()
+
+            # Nothing new, our own message, or a system line -> keep watching.
+            if (
+                not latest
+                or latest == last_processed
+                or (last_sent and last_sent in latest)
+                or _is_system_line(latest)
+            ):
+                if latest and _is_system_line(latest):
+                    last_processed = latest
+                time.sleep(poll_seconds)
+                continue
+
+            print(f"them > {latest}")
+            last_processed = latest
+
+            # Stop condition: the other person said bye.
+            if "bye" in latest.lower():
+                farewell = "Bye! Talk to you later."
+                send_teams_message(farewell)
+                print(f"me   > {farewell}")
+                print("\n[converse] heard 'bye' - ending conversation.")
+                break
+
+            # Generate a reply (plain chat, no tools) and send it.
+            messages.append({"role": "user", "content": latest})
+            reply = _chat(messages).get("content", "").strip()
+            if not reply:
+                time.sleep(poll_seconds)
+                continue
+            messages.append({"role": "assistant", "content": reply})
+
+            send_teams_message(reply)
+            last_sent = reply
+            print(f"me   > {reply}")
+
+            time.sleep(poll_seconds)
+    except (KeyboardInterrupt, EOFError):
+        print("\n[converse] aborted.")
 
 
 # Map tool NAME -> the actual Python function to run.
@@ -288,6 +479,8 @@ TOOL_REGISTRY = {
     "calculator": calculator,
     "open_url": open_url,
     "join_teams": join_teams,
+    "read_teams_chat": read_teams_chat,
+    "send_teams_message": send_teams_message,
 }
 
 
@@ -373,6 +566,46 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_teams_chat",
+            "description": (
+                "Read the most recent messages from the currently open "
+                "Microsoft Teams meeting chat pane."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many recent messages to read (default 20).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_teams_message",
+            "description": (
+                "Type and send a message into the currently open Microsoft "
+                "Teams meeting chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message text to send.",
+                    }
+                },
+                "required": ["message"],
+            },
+        },
+    },
 ]
 
 
@@ -410,15 +643,20 @@ def ask(prompt: str, history: list | None = None) -> str:
 # 5. THE AGENT LOOP — this is where tool calling actually happens.
 # =============================================================================
 
-def agent(prompt: str, max_steps: int = 5) -> str:
-    """Run a tool-calling loop:
+def agent(prompt: str, messages: list | None = None, max_steps: int = 5):
+    """Run one tool-calling turn and return (reply, messages).
 
       1. Send prompt + tool schemas to the model.
       2. If the model returns tool_calls, RUN them here in Python.
       3. Feed the results back and ask again.
       4. Repeat until the model answers with plain text (no more tool calls).
+
+    Pass the returned `messages` back in on the next call to keep multi-turn
+    conversation context (used by the interactive loop).
     """
-    messages = [{"role": "user", "content": prompt}]
+    if messages is None:
+        messages = []
+    messages.append({"role": "user", "content": prompt})
 
     for step in range(max_steps):
         message = _chat(messages, tools=TOOLS_SCHEMA)
@@ -427,7 +665,7 @@ def agent(prompt: str, max_steps: int = 5) -> str:
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             # No tool requested -> this is the final natural-language answer.
-            return message.get("content", "")
+            return message.get("content", ""), messages
 
         # The model asked to call one or more tools. Execute each locally.
         for call in tool_calls:
@@ -447,7 +685,7 @@ def agent(prompt: str, max_steps: int = 5) -> str:
             # Send the tool's output back to the model as a 'tool' message.
             messages.append({"role": "tool", "content": str(result)})
 
-    return "Stopped: reached max tool-calling steps without a final answer."
+    return "Stopped: reached max tool-calling steps without a final answer.", messages
 
 
 # =============================================================================
@@ -455,10 +693,12 @@ def agent(prompt: str, max_steps: int = 5) -> str:
 # =============================================================================
 
 def chat_loop() -> None:
+    """Interactive REPL with tool access and persistent conversation history."""
     print(f"Connected to {OLLAMA_HOST} (model: {MODEL})")
+    print("Tools enabled: open_url, join_teams, read_teams_chat, send_teams_message, ...")
     print("Type your message. Use 'exit' or Ctrl-C to quit.\n")
 
-    history: list[dict] = []
+    messages: list = []
     try:
         while True:
             prompt = input("you > ").strip()
@@ -467,10 +707,8 @@ def chat_loop() -> None:
             if prompt.lower() in {"exit", "quit"}:
                 break
 
-            reply = ask(prompt, history)
+            reply, messages = agent(prompt, messages)
             print(f"\nagent > {reply}\n")
-            history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": reply})
     except (KeyboardInterrupt, EOFError):
         print("\nBye.")
 
@@ -483,6 +721,20 @@ def main() -> None:
         print(setup_teams_no_prompt())
         return
 
+    # Autonomous mode: watch the Teams chat and reply until someone says 'bye'.
+    if args and args[0] == "--converse":
+        # Optional: join a meeting first if a URL is given.
+        rest = args[1:]
+        if rest and rest[0].startswith(("http://", "https://")):
+            print(join_teams(rest[0]))
+            time.sleep(5)  # let the web client load before watching
+        try:
+            converse_teams()
+        except requests.exceptions.ConnectionError:
+            print(f"ERROR: Could not reach Ollama at {OLLAMA_HOST}.", file=sys.stderr)
+            sys.exit(1)
+        return
+
     use_tools = False
     if args and args[0] == "--tools":
         use_tools = True
@@ -491,11 +743,13 @@ def main() -> None:
     try:
         if use_tools:
             if not args:
-                print("Usage: python chat_agent.py --tools \"<your prompt>\"")
-                sys.exit(2)
+                # --tools with no prompt -> interactive tool-enabled REPL.
+                chat_loop()
+                return
             prompt = " ".join(args)
             print(f"[model: {MODEL}]  running agent with tools...\n")
-            print(agent(prompt))
+            reply, _ = agent(prompt)
+            print(reply)
         elif args:
             print(ask(" ".join(args)))
         else:
