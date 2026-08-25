@@ -30,6 +30,73 @@ resource "aws_internet_gateway" "igw" {
   }
 }
 
+# =============================================================================
+# VPC Flow Logs -> CloudWatch Logs
+# =============================================================================
+
+# Log group that receives the flow logs.
+resource "aws_cloudwatch_log_group" "vpc_flow" {
+  count             = var.create_vpc ? 1 : 0
+  name              = "/vpc/flow-logs/${var.project_tag}"
+  retention_in_days = 1
+
+  tags = {
+    Name = "${var.project_tag}-vpc-flow-logs"
+  }
+}
+
+# IAM role the VPC Flow Logs service assumes to write to CloudWatch Logs.
+resource "aws_iam_role" "vpc_flow" {
+  count = var.create_vpc ? 1 : 0
+  name  = "${var.project_tag}-vpc-flow-log-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "vpc-flow-logs.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "vpc_flow" {
+  count = var.create_vpc ? 1 : 0
+  name  = "${var.project_tag}-vpc-flow-log-policy"
+  role  = aws_iam_role.vpc_flow[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ]
+      Resource = "${aws_cloudwatch_log_group.vpc_flow[0].arn}:*"
+    }]
+  })
+}
+
+# Capture ALL traffic (accepted + rejected) for the whole VPC.
+resource "aws_flow_log" "main" {
+  count                = var.create_vpc ? 1 : 0
+  vpc_id               = aws_vpc.main[0].id
+  traffic_type         = "ALL"
+  log_destination_type = "cloud-watch-logs"
+  log_destination      = aws_cloudwatch_log_group.vpc_flow[0].arn
+  iam_role_arn         = aws_iam_role.vpc_flow[0].arn
+
+  tags = {
+    Name = "${var.project_tag}-vpc-flow-log"
+  }
+}
+
 resource "aws_subnet" "public" {
   count                   = var.create_vpc ? length(var.public_subnet_cidrs) : 0
   vpc_id                  = aws_vpc.main[0].id
@@ -447,6 +514,11 @@ resource "aws_lb_listener_rule" "backend" {
 # =============================================================================
 # Outputs
 # =============================================================================
+
+output "vpc_flow_log_group" {
+  description = "CloudWatch Log group receiving VPC flow logs"
+  value       = var.create_vpc ? aws_cloudwatch_log_group.vpc_flow[0].name : null
+}
 
 output "alb_dns_name" {
   description = "ALB DNS name"
