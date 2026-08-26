@@ -245,8 +245,8 @@ def get_patch_status(case: str = "", sr_account: str = "") -> str:
     if not (sr_account and str(sr_account).isdigit()):
         sr_account = NLB_SR_ACCOUNT
     if not case or not sr_account:
-        return ("No case/SR account set. Provide them or set NLB_CASE and "
-                "NLB_SR_ACCOUNT env vars.")
+        return ("ERROR: No case/SR account set. Provide them or set NLB_CASE "
+                "and NLB_SR_ACCOUNT env vars.")
 
     remote_cmd = f"{MONITOR_SCRIPT} {case} {sr_account} --once"
     try:
@@ -256,13 +256,16 @@ def get_patch_status(case: str = "", sr_account: str = "") -> str:
             encoding="utf-8", errors="replace",  # monitor output has emojis
         )
     except FileNotFoundError:
-        return "ssh not found on PATH. Install/enable OpenSSH client."
+        return "ERROR: ssh not found on PATH. Install/enable OpenSSH client."
     except subprocess.TimeoutExpired:
-        return "Patch monitor timed out (no result within 5 minutes)."
+        return "ERROR: Patch monitor timed out (no result within 5 minutes)."
 
     out = (proc.stdout or "") + (proc.stderr or "")
     if not out.strip():
-        return f"No output from monitor (exit {proc.returncode})."
+        return f"ERROR: No output from monitor (exit {proc.returncode})."
+    if proc.returncode != 0:
+        tail = "\n".join(out.splitlines()[-15:])
+        return f"ERROR: Monitor exited {proc.returncode}.\n{tail}"
 
     # Extract the concise cycle summary if present, else return the tail.
     lines = out.splitlines()
@@ -629,26 +632,63 @@ def join_teams(url: str, display_name: str = "David's AI Agent") -> str:
         return f"Failed to join Teams meeting: {e}"
 
 
+# Selectors that indicate the chat compose box (i.e. the chat rail is open).
+# Teams builds vary: older ones expose div[data-tid='ckeditor']; newer ones
+# render a contenteditable textbox and/or a "Type a message" input.
+_SEL_CHAT_COMPOSE = [
+    "div[data-tid='ckeditor']",
+    "div[data-tid='ckeditor'] [contenteditable='true']",
+    "div[role='textbox'][contenteditable='true']",
+    "[data-tid='newMessageCommandBar']",
+    "[aria-label='Type a message']",
+    "[placeholder='Type a message']",
+]
+
+
 def _chat_pane_open(page) -> bool:
     """True if the chat compose box is visible (chat rail is open)."""
-    return _has(page, ["div[data-tid='ckeditor']"])
+    return _has(page, _SEL_CHAT_COMPOSE)
 
 
-def _ensure_chat_open(page, wait_seconds: int = 15) -> bool:
-    """Make sure the chat rail is open, retrying while the meeting UI loads."""
+def _ensure_chat_open(page, wait_seconds: int = 25) -> bool:
+    """Make sure the chat rail is open, retrying while the meeting UI loads.
+
+    Re-clicks the Chat button periodically (not just once) because on a fresh
+    join the toolbar may not be interactive yet, so the first click is a no-op.
+    Detects success via _SEL_CHAT_COMPOSE, which covers old (ckeditor) and new
+    (contenteditable textbox) Teams builds.
+    """
     deadline = time.time() + wait_seconds
-    clicked = False
+    last_click = 0.0
     while time.time() < deadline:
         if _chat_pane_open(page):
             return True
-        toggle = _first_visible(page, _SEL_CHAT_TOGGLE)
-        if toggle and not clicked:
-            try:
-                _js_click(page, toggle)
-                clicked = True
-                print("  [chat] clicked chat button to open the pane")
-            except Exception:
-                pass
+        # Re-click at most every 3s so a not-yet-ready toolbar gets retried.
+        if time.time() - last_click >= 3:
+            toggle = _first_visible(page, _SEL_CHAT_TOGGLE)
+            if toggle is None:
+                # Toolbar may have auto-hidden; nudge it and try any present
+                # (not necessarily visible) chat button via JS.
+                try:
+                    page.mouse.move(500, 700)
+                except Exception:
+                    pass
+                for sel in _SEL_CHAT_TOGGLE:
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() > 0:
+                            _js_click(page, loc.first)
+                            print(f"  [chat] clicked chat button via JS ({sel})")
+                            break
+                    except Exception:
+                        continue
+            else:
+                try:
+                    _js_click(page, toggle)
+                    print("  [chat] clicked chat button to open the pane")
+                except Exception:
+                    pass
+            last_click = time.time()
         time.sleep(1)
     ok = _chat_pane_open(page)
     if not ok:
@@ -707,8 +747,27 @@ def _format_status_reply(status: str) -> str:
     Avoids the model padding/hallucinating. Parses the totals line, e.g.:
         - Total: 2 | Patched: 0 | Pending: 2 | Failed: 0
     and returns e.g. "Patching update: 0/2 patched, 2 pending, 0 failed."
+
+    If the status is an error/timeout marker (prefixed 'ERROR:'), report the
+    failure plainly instead of misparsing it into a fake "0 pending".
     """
+    if _is_status_error(status):
+        return ("Couldn't get the patching status right now (the check failed "
+                "or timed out). I'll retry.")
+
     import re as _re
+
+    # Monitor reports outstanding work as "N instance(s) remaining" (e.g.
+    # "startup accts_inputs_filtered.txt OK - 21 instance(s) remaining.").
+    # Prefer this exact, deterministic phrasing over the model's prose.
+    m_remaining = _re.search(r"(\d+)\s+instance\(?s?\)?\s+remaining",
+                             status, _re.IGNORECASE)
+    if m_remaining is not None:
+        n = int(m_remaining.group(1))
+        if n == 0:
+            return "Status: all instances are patched - nothing remaining."
+        return f"Status: {n} instances remaining to be patched."
+
     total = patched = pending = failed = None
     for key in ("total", "patched", "pending", "failed"):
         m = _re.search(rf"{key}\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
@@ -754,21 +813,35 @@ def _format_status_reply(status: str) -> str:
     return "No patching status available yet."
 
 
+def _is_status_error(status: str) -> bool:
+    """True when get_patch_status returned a failure marker rather than a real
+    status. All failure paths in get_patch_status are prefixed with 'ERROR:'."""
+    return (status or "").lstrip().upper().startswith("ERROR:")
+
+
 def _is_all_patched(status: str) -> bool:
     """True when the monitor output shows nothing left to patch.
 
     Used by the proactive 30-min broadcast to know when to announce completion
-    and stop. Matches either an explicit 'Pending: 0' (with no failures) or the
-    'all compliant / list is empty' case.
+    and stop. Only returns True on a REAL status: an explicit 'Pending: 0'
+    (with no failures) or the 'all compliant / list is empty' case. Never
+    treats an error/timeout result as 'all patched'.
     """
     import re as _re
+    # An error/timeout is NOT completion -> don't stop the timer on it.
+    if _is_status_error(status):
+        return False
+
     low = status.lower()
     if "compliant" in low or "is empty" in low:
         return True
 
+    # Require an explicit totals line so a garbled/partial output can't be
+    # misread as "0 pending". We only trust Pending:N when Total is also present.
     m_pending = _re.search(r"pending\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
+    m_total = _re.search(r"total\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
     m_failed = _re.search(r"failed\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
-    if m_pending is not None:
+    if m_pending is not None and m_total is not None:
         pending = int(m_pending.group(1))
         failed = int(m_failed.group(1)) if m_failed else 0
         return pending == 0 and failed == 0
@@ -911,11 +984,39 @@ def leave_meeting() -> str:
         page = _teams_page()
         if page is None:
             return "No Teams tab is open."
+
+        # 1) Prefer a visible Leave button.
         btn = _first_visible(page, _SEL_LEAVE)
         if btn:
             _js_click(page, btn)
             return "Clicked Leave - left the meeting."
-        # Fallback: the control bar may be hidden -> keyboard shortcut.
+
+        # 2) The control bar auto-hides after a few idle seconds, so the Leave
+        #    button is in the DOM but reports not-visible and _first_visible
+        #    skips it. Nudge the toolbar to reappear, then retry visible.
+        try:
+            page.mouse.move(400, 300)
+            page.mouse.move(500, 700)  # bottom area where the control bar lives
+        except Exception:
+            pass
+        time.sleep(0.5)
+        btn = _first_visible(page, _SEL_LEAVE)
+        if btn:
+            _js_click(page, btn)
+            return "Clicked Leave - left the meeting."
+
+        # 3) Still hidden -> click the present-but-not-visible button via JS.
+        #    _js_click works on elements that aren't visually rendered.
+        for sel in _SEL_LEAVE:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    _js_click(page, loc.first)
+                    return "Clicked Leave (via JS on hidden control bar) - left the meeting."
+            except Exception:
+                continue
+
+        # 4) Last resort: keyboard shortcut (Teams web may ignore this).
         try:
             page.keyboard.press("Control+Shift+H")
             return "Sent Leave shortcut (Ctrl+Shift+H) - left the meeting."
@@ -1007,6 +1108,13 @@ def converse_teams(poll_seconds: int = 3, max_chat_fails: int = 3) -> None:
                 next_status_broadcast = time.time() + status_broadcast_interval
                 print("  [converse] scheduled 30-min update -> get_patch_status")
                 status = get_patch_status()
+                # A timeout/SSH failure is NOT a status. Don't post it to the
+                # meeting or let it trip the "all patched" logic; log it, alert
+                # Slack, and try again on the next scheduled cycle.
+                if _is_status_error(status):
+                    print(f"  [converse] status check failed, will retry: {status}")
+                    notify_slack(f":warning: Patch status check failed: {status}")
+                    continue
                 reply = _format_status_reply(status)
                 send_teams_message(reply)
                 messages.append({"role": "assistant", "content": reply})
