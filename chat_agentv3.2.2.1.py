@@ -125,6 +125,110 @@ MONITOR_SCRIPT = os.environ.get("MONITOR_SCRIPT", "")
 NLB_CASE = os.environ.get("NLB_CASE", "")
 NLB_SR_ACCOUNT = os.environ.get("NLB_SR_ACCOUNT", "")
 
+# --- Patch targets (one case per OS) -----------------------------------------
+# A patching session usually covers two separate SR cases under the SAME SR
+# account: one for the Windows fleet and one for the RHEL fleet. Each target is
+# {"label", "os", "case", "account"}. The agent can then report Windows and
+# RHEL separately ("what's the RHEL status?") or together ("any updates?").
+#
+# Config (in .env):
+#   NLB_SR_ACCOUNT        shared SR account id for both cases
+#   NLB_CASE_WINDOWS      SR/case number for the Windows fleet
+#   NLB_CASE_RHEL         SR/case number for the RHEL fleet
+#
+# Backward compatible: if neither OS case is set, we fall back to a single
+# unlabeled target built from the legacy NLB_CASE / NLB_SR_ACCOUNT, so older
+# single-case setups behave exactly as before.
+NLB_CASE_WINDOWS = os.environ.get("NLB_CASE_WINDOWS", "")
+NLB_CASE_RHEL = os.environ.get("NLB_CASE_RHEL", "")
+
+
+def _build_patch_targets() -> list:
+    """Return the list of patch targets from .env.
+
+    Each target: {"label": str, "os": str, "case": str, "account": str}.
+    Only targets with an all-digit case are included. Falls back to a single
+    legacy target (from NLB_CASE) when no OS-specific case is configured.
+    """
+    account = NLB_SR_ACCOUNT
+    targets = []
+    for label, os_key, case in (
+        ("Windows", "windows", NLB_CASE_WINDOWS),
+        ("RHEL", "rhel", NLB_CASE_RHEL),
+    ):
+        if case and str(case).isdigit() and account:
+            targets.append({"label": label, "os": os_key,
+                            "case": str(case), "account": str(account)})
+
+    if not targets and NLB_CASE and str(NLB_CASE).isdigit() and account:
+        # Legacy single-case mode: no OS label.
+        targets.append({"label": "", "os": "", "case": str(NLB_CASE),
+                        "account": str(account)})
+    return targets
+
+
+PATCH_TARGETS = _build_patch_targets()
+
+# Keyword aliases used to route a request to a specific OS target.
+_OS_ALIASES = {
+    "windows": ("windows", "win", "wintel"),
+    "rhel": ("rhel", "linux", "red hat", "redhat", "rh "),
+}
+
+
+def _resolve_targets(selector: str = "") -> list:
+    """Pick which patch target(s) a request refers to.
+
+    `selector` may be a chat message or an explicit value: an OS name
+    ('windows', 'rhel'/'linux'), a case number, or blank. Blank returns ALL
+    configured targets. Returns a list of target dicts (possibly empty).
+    """
+    sel = (selector or "").strip().lower()
+    if not sel:
+        return list(PATCH_TARGETS)
+
+    # 1) Exact case number match (digits anywhere in the text).
+    import re as _re
+    for m in _re.findall(r"\d{6,}", sel):
+        for t in PATCH_TARGETS:
+            if t["case"] == m:
+                return [t]
+
+    # 2) OS keyword match.
+    matched = []
+    for t in PATCH_TARGETS:
+        aliases = _OS_ALIASES.get(t["os"], (t["os"],)) if t["os"] else ()
+        if any(a and a in sel for a in aliases):
+            matched.append(t)
+    if matched:
+        return matched
+
+    # 3) No specific match -> all targets (caller decides what to do).
+    return list(PATCH_TARGETS)
+
+
+def _explicit_target(text: str) -> list:
+    """Return the target(s) a message EXPLICITLY names (OS keyword or case
+    number), or [] if it names none. Unlike _resolve_targets, this does NOT
+    fall back to 'all' - so the caller can tell a specific request ('rhel
+    status') apart from a general one ('any updates?')."""
+    sel = (text or "").strip().lower()
+    if not sel:
+        return []
+
+    import re as _re
+    for m in _re.findall(r"\d{6,}", sel):
+        for t in PATCH_TARGETS:
+            if t["case"] == m:
+                return [t]
+
+    matched = []
+    for t in PATCH_TARGETS:
+        aliases = _OS_ALIASES.get(t["os"], (t["os"],)) if t["os"] else ()
+        if any(a and a in sel for a in aliases):
+            matched.append(t)
+    return matched
+
 # --- Amazon Bedrock backend --------------------------------------------------
 # This build uses Bedrock's Converse API instead of a self-hosted Ollama server.
 # Auth uses a Bedrock API KEY (a bearer token you generate in the Bedrock
@@ -237,24 +341,16 @@ def get_time(timezone: str = "") -> str:
     return now.strftime(f"%Y-%m-%d %H:%M:%S ({label})")
 
 
-def get_patch_status(case: str = "", sr_account: str = "") -> str:
-    """Run the NLB patch monitor over SSH (one cycle) and return the summary.
+def _run_monitor_once(case: str, sr_account: str) -> str:
+    """Run the NLB patch monitor over SSH for ONE case and return its summary.
 
-    Use this when someone asks for a patching update, e.g. "any updates?",
-    "how many are left?", "what's the status?". Runs:
-        ssh <SSH_HOST> "<MONITOR_SCRIPT> <case> <sr_account> --once"
-    and returns the cycle summary (totals + outstanding instances).
+    Runs: ssh <SSH_HOST> "<MONITOR_SCRIPT> <case> <sr_account> --once"
+    Returns the cycle summary, or an 'ERROR: ...' marker on failure/timeout.
     """
-    # Guard: small models sometimes pass the literal env-var NAMES
-    # ('NLB_CASE') or other junk instead of a value. Only accept all-digit
-    # values; otherwise fall back to the configured defaults from .env.
     if not (case and str(case).isdigit()):
-        case = NLB_CASE
+        return "ERROR: invalid or missing case number."
     if not (sr_account and str(sr_account).isdigit()):
-        sr_account = NLB_SR_ACCOUNT
-    if not case or not sr_account:
-        return ("ERROR: No case/SR account set. Provide them or set NLB_CASE "
-                "and NLB_SR_ACCOUNT env vars.")
+        return "ERROR: invalid or missing SR account."
 
     remote_cmd = f"{MONITOR_SCRIPT} {case} {sr_account} --once"
     try:
@@ -293,6 +389,48 @@ def get_patch_status(case: str = "", sr_account: str = "") -> str:
     if summary:
         return "\n".join(summary)
     return "\n".join(lines[-15:])  # fallback: last 15 lines
+
+
+def get_patch_status(target: str = "", case: str = "", sr_account: str = "") -> str:
+    """Get NLB patching status for one OS target or all of them.
+
+    Use this when someone asks for a patching update, e.g. "any updates?",
+    "how many are left?", "what's the RHEL status?", "how's Windows doing?".
+
+    `target` selects which fleet: 'windows', 'rhel'/'linux', a case number, or
+    blank for ALL configured targets. `case`/`sr_account` are legacy overrides
+    (still honoured if a bare case number is passed).
+
+    Returns a labeled summary. With multiple targets the reply has one line per
+    OS, e.g.:
+        Windows: 3 instances remaining to be patched.
+        RHEL: all instances are patched - nothing remaining.
+    """
+    # Legacy path: an explicit numeric case (small models sometimes pass the
+    # env-var NAME instead of a value, so only accept all-digit).
+    if case and str(case).isdigit():
+        acct = sr_account if (sr_account and str(sr_account).isdigit()) else NLB_SR_ACCOUNT
+        return _format_status_reply(_run_monitor_once(str(case), acct))
+
+    if not PATCH_TARGETS:
+        return ("ERROR: No patch targets configured. Set NLB_CASE_WINDOWS / "
+                "NLB_CASE_RHEL (and NLB_SR_ACCOUNT), or the legacy NLB_CASE.")
+
+    targets = _resolve_targets(target)
+    if not targets:
+        return "ERROR: No matching patch target for that request."
+
+    # Single unlabeled target (legacy mode) -> return the bare formatted line.
+    if len(targets) == 1 and not targets[0]["label"]:
+        t = targets[0]
+        return _format_status_reply(_run_monitor_once(t["case"], t["account"]))
+
+    results = _collect_target_status(targets)
+    # One target -> bare label line; multiple -> one labeled line each.
+    if len(results) == 1:
+        r = results[0]
+        return f"{r['target']['label']}: {r['line']}"
+    return "\n".join(f"{r['target']['label']}: {r['line']}" for r in results)
 
 
 # Chrome remote-debugging endpoint. Start Chrome first with:
@@ -765,17 +903,19 @@ def _format_status_reply(status: str) -> str:
 
     import re as _re
 
-    # Monitor reports outstanding work as "N instance(s) remaining" (e.g.
-    # "startup accts_inputs_filtered.txt OK - 21 instance(s) remaining.").
-    # Prefer this exact, deterministic phrasing over the model's prose.
-    m_remaining = _re.search(r"(\d+)\s+instance\(?s?\)?\s+remaining",
-                             status, _re.IGNORECASE)
-    if m_remaining is not None:
-        n = int(m_remaining.group(1))
-        if n == 0:
-            return "Status: all instances are patched - nothing remaining."
-        return f"Status: {n} instances remaining to be patched."
+    low_all = status.lower()
 
+    # 1) AUTHORITATIVE completion sentence. The monitor prints this only once
+    #    it has reconciled compliance for the whole fleet, so it outranks the
+    #    stale "N instance(s) remaining" startup echo below.
+    if ("all instances patched" in low_all
+            or "monitor complete" in low_all
+            or "all instances are patched" in low_all):
+        return "Status: all instances are patched - nothing remaining."
+
+    # 2) AUTHORITATIVE totals line, e.g.
+    #    "Total: 38 | Patched: 38 | Pending: 0 | Failed: 0".
+    #    This is the real cycle result; prefer it over the startup echo.
     total = patched = pending = failed = None
     for key in ("total", "patched", "pending", "failed"):
         m = _re.search(rf"{key}\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
@@ -791,19 +931,32 @@ def _format_status_reply(status: str) -> str:
                 failed = val
 
     if pending is not None or (total is not None and patched is not None):
-        # Lead with what's left to patch.
         if pending is None and total is not None and patched is not None:
             pending = total - patched
-        parts = [f"{pending} pending"]
+        if pending == 0 and not failed:
+            return "Status: all instances are patched - nothing remaining."
+        noun = "instance" if pending == 1 else "instances"
+        msg = f"Status: {pending} {noun} remaining to be patched."
         if failed:
-            parts.append(f"{failed} failed")
-        return "Patching update: " + ", ".join(parts) + "."
+            msg = msg[:-1] + f" ({failed} failed)."
+        return msg
 
-    # "All compliant" case: the monitor's input list is empty, meaning there
-    # is nothing left to patch.
-    low_all = status.lower()
+    # 3) "All compliant / input is empty" -> nothing left to patch.
     if "compliant" in low_all or "is empty" in low_all:
-        return "All instances are patched - nothing pending."
+        return "Status: all instances are patched - nothing remaining."
+
+    # 4) LAST RESORT: the "N instance(s) remaining" line. This is a startup
+    #    echo printed BEFORE compliance is reconciled, so it can be stale (it
+    #    still shows the pre-patch count even when everything is done). Only
+    #    trust it when none of the authoritative signals above were present.
+    m_remaining = _re.search(r"(\d+)\s+instance\(?s?\)?\s+remaining",
+                             status, _re.IGNORECASE)
+    if m_remaining is not None:
+        n = int(m_remaining.group(1))
+        if n == 0:
+            return "Status: all instances are patched - nothing remaining."
+        noun = "instance" if n == 1 else "instances"
+        return f"Status: {n} {noun} remaining to be patched."
 
     # Fallback: couldn't parse totals -> return a meaningful line, skipping
     # monitor log noise (timestamps, banners, config echoes).
@@ -841,11 +994,16 @@ def _is_all_patched(status: str) -> bool:
         return False
 
     low = status.lower()
+
+    # 1) Explicit completion sentence (printed after compliance is reconciled).
+    if ("all instances patched" in low or "monitor complete" in low
+            or "all instances are patched" in low):
+        return True
     if "compliant" in low or "is empty" in low:
         return True
 
-    # Require an explicit totals line so a garbled/partial output can't be
-    # misread as "0 pending". We only trust Pending:N when Total is also present.
+    # 2) Authoritative totals line. Checked BEFORE the "N remaining" echo,
+    #    which is a stale startup line printed before reconciliation.
     m_pending = _re.search(r"pending\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
     m_total = _re.search(r"total\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
     m_failed = _re.search(r"failed\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
@@ -853,7 +1011,160 @@ def _is_all_patched(status: str) -> bool:
         pending = int(m_pending.group(1))
         failed = int(m_failed.group(1)) if m_failed else 0
         return pending == 0 and failed == 0
+
+    # 3) LAST RESORT: "0 instance(s) remaining" (only if no totals line above).
+    m_rem = _re.search(r"(\d+)\s+instance\(?s?\)?\s+remaining", status,
+                       _re.IGNORECASE)
+    if m_rem is not None:
+        return int(m_rem.group(1)) == 0
+
     return False
+
+
+def _strip_status_prefix(line: str) -> str:
+    """Drop the generic 'Status:' / 'Patching update:' lead so an OS label
+    reads cleanly (e.g. 'Windows: 3 instances remaining')."""
+    for pfx in ("Patching update:", "Status:"):
+        if line.startswith(pfx):
+            return line[len(pfx):].strip()
+    return line
+
+
+def _collect_target_status(targets: list) -> list:
+    """Run the monitor once per target and return structured results.
+
+    Each item: {"target": <target dict>, "raw": str, "line": str,
+                "done": bool, "error": bool}. This is the single source of
+    truth the reply composers build on, so the SSH call and parsing live in
+    one place.
+    """
+    results = []
+    for t in targets:
+        raw = _run_monitor_once(t["case"], t["account"])
+        error = _is_status_error(raw)
+        results.append({
+            "target": t,
+            "raw": raw,
+            "line": _strip_status_prefix(_format_status_reply(raw)),
+            "done": (not error) and _is_all_patched(raw),
+            "error": error,
+        })
+    return results
+
+
+def get_patch_status_all():
+    """Run every configured target once; return (labeled_reply, all_done, any_error).
+
+    Used by the proactive broadcast so it can (a) post one combined message,
+    (b) know when EVERY target is fully patched (to announce completion and
+    stop), and (c) skip posting when a check errored/timed out.
+    """
+    if not PATCH_TARGETS:
+        return ("ERROR: No patch targets configured.", False, True)
+
+    results = _collect_target_status(PATCH_TARGETS)
+    multi = len([t for t in PATCH_TARGETS if t["label"]]) > 1
+
+    labeled = []
+    for r in results:
+        if r["error"]:
+            continue
+        t = r["target"]
+        labeled.append(f"{(t['label'] or t['case'])}: {r['line']}" if multi
+                       else r["line"])
+
+    all_done = all(r["done"] for r in results) and not any(r["error"] for r in results)
+    any_error = any(r["error"] for r in results)
+    return ("\n".join(labeled), all_done, any_error)
+
+
+# Tracks OS labels the agent has already acknowledged as complete in the chat,
+# so a general "how's the update?" only ASKS "did you mean <the remaining
+# one>?" the FIRST time a fleet finishes — then it just reports the remaining
+# fleet on repeats instead of nagging. Reset per process (per meeting).
+_completed_acknowledged = set()
+
+
+def general_status_reply() -> str:
+    """Compose the reply to a GENERAL status question (no OS named).
+
+    - Both (all) fleets still in progress -> report each, labeled.
+    - Exactly one fleet outstanding, the other(s) done:
+        * first time after completion -> report the outstanding fleet and ASK
+          the human to confirm that's what they meant.
+        * afterwards -> just report the outstanding fleet (no repeated asking).
+    - All fleets done -> say so plainly.
+    - Errors -> report the failure plainly (caller decides whether to post).
+    """
+    if not PATCH_TARGETS:
+        return ("ERROR: No patch targets configured. Set NLB_CASE_WINDOWS / "
+                "NLB_CASE_RHEL (and NLB_SR_ACCOUNT), or the legacy NLB_CASE.")
+
+    # Legacy single unlabeled target -> just the bare line.
+    labeled_targets = [t for t in PATCH_TARGETS if t["label"]]
+    if not labeled_targets:
+        t = PATCH_TARGETS[0]
+        return _format_status_reply(_run_monitor_once(t["case"], t["account"]))
+
+    results = _collect_target_status(PATCH_TARGETS)
+
+    if all(r["error"] for r in results):
+        return ("Couldn't get the patching status right now (the checks failed "
+                "or timed out). I'll retry.")
+
+    ok = [r for r in results if not r["error"]]
+    outstanding = [r for r in ok if not r["done"]]
+    done = [r for r in ok if r["done"]]
+
+    # All done.
+    if not outstanding:
+        names = _join_labels([r["target"]["label"] for r in done])
+        return f"{names} are fully patched - nothing left."
+
+    # More than one still outstanding (or nothing done yet) -> report each.
+    if len(outstanding) > 1 or not done:
+        lines = [f"{r['target']['label']}: {r['line']}" for r in ok]
+        return "\n".join(lines)
+
+    # Exactly one outstanding, at least one done -> the ambiguous case.
+    out = outstanding[0]
+    out_label = out["target"]["label"]
+    done_names = _join_labels([r["target"]["label"] for r in done])
+
+    # Ask the confirming question only the FIRST time we hit this
+    # one-done/one-outstanding situation. Key the "already asked" flag on the
+    # outstanding fleet so repeats just report it instead of nagging.
+    ask_key = f"asked:{out_label}"
+    already_asked = ask_key in _completed_acknowledged
+
+    if not already_asked:
+        _completed_acknowledged.add(ask_key)
+        return (f"{done_names} is already complete. {out_label} still has "
+                f"{_remaining_phrase(out)}. Did you mean the {out_label} update?")
+    # Subsequent general asks: just report the outstanding fleet.
+    return f"{out_label}: {out['line']}"
+
+
+def _remaining_phrase(result: dict) -> str:
+    """A short 'N instance(s) remaining' phrase for the outstanding fleet."""
+    import re as _re
+    m = _re.search(r"(\d+)\s+instance", result["line"], _re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        return f"{n} instance remaining" if n == 1 else f"{n} instances remaining"
+    return "instances remaining"
+
+
+def _join_labels(labels: list) -> str:
+    """'Windows' / 'Windows and RHEL' / 'A, B and C'."""
+    labels = [l for l in labels if l]
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return ", ".join(labels[:-1]) + f" and {labels[-1]}"
 
 
 import re  # noqa: E402
@@ -1043,12 +1354,40 @@ FAREWELL_MESSAGE = os.environ.get(
 
 
 # Opening message the agent posts when it joins the meeting chat.
-INTRO_MESSAGE = os.environ.get(
-    "INTRO_MESSAGE",
-    "Hello, I'm David's AI assistant sitting in for David. "
-    "I'll update the status of those instances every 30 mins until all instances are patched. "
-    "Feel free to chat with me here - say 'bye' when you're done.",
-)
+def _targets_phrase() -> str:
+    """Human phrase naming the configured targets, e.g.
+    'Windows (case 178761970500494) and RHEL (case 178762556000269)'.
+    Empty string when there's nothing labeled (legacy single-case mode)."""
+    labeled = [t for t in PATCH_TARGETS if t["label"]]
+    if not labeled:
+        return ""
+    parts = [f"{t['label']} (case {t['case']})" for t in labeled]
+    if len(parts) == 1:
+        return parts[0]
+    return " and ".join([", ".join(parts[:-1]), parts[-1]]) if len(parts) > 2 \
+        else " and ".join(parts)
+
+
+def _default_intro() -> str:
+    phrase = _targets_phrase()
+    if phrase:
+        return (
+            "Hello, I'm David's AI assistant sitting in for David. "
+            f"Today we're patching {phrase}. "
+            "I'll post a status update for each every 30 mins until all "
+            "instances are patched. "
+            "Feel free to chat with me here - say 'bye' when you're done."
+        )
+    return (
+        "Hello, I'm David's AI assistant sitting in for David. "
+        "I'll update the status of those instances every 30 mins until all "
+        "instances are patched. "
+        "Feel free to chat with me here - say 'bye' when you're done."
+    )
+
+
+# Explicit INTRO_MESSAGE in .env still wins; otherwise build it from targets.
+INTRO_MESSAGE = os.environ.get("INTRO_MESSAGE", "") or _default_intro()
 
 
 def _intro_already_posted(page, lookback: int = 40) -> bool:
@@ -1097,6 +1436,10 @@ CONVERSE_SYSTEM_PROMPT = (
     "When asked for a patching update/status or how many instances are left, "
     "you MUST call the get_patch_status tool and reply with the real numbers - "
     "never guess or say it's 'being updated' without checking. "
+    "There may be separate Windows and RHEL fleets: if someone asks about a "
+    "specific OS (e.g. 'RHEL status', 'how's Windows?'), pass that OS as the "
+    "tool's `target`; if they ask generally, leave `target` blank to report "
+    "all fleets. "
     "Do not narrate your actions."
 )
 
@@ -1175,22 +1518,22 @@ def converse_teams(poll_seconds: int = 3, max_chat_fails: int = 3) -> None:
             if (not all_patched_announced
                     and time.time() >= next_status_broadcast):
                 next_status_broadcast = time.time() + status_broadcast_interval
-                print("  [converse] scheduled 30-min update -> get_patch_status")
-                status = get_patch_status()
-                # A timeout/SSH failure is NOT a status. Don't post it to the
-                # meeting or let it trip the "all patched" logic; log it, alert
-                # Slack, and try again on the next scheduled cycle.
-                if _is_status_error(status):
-                    print(f"  [converse] status check failed, will retry: {status}")
-                    notify_slack(f":warning: Patch status check failed: {status}")
-                    continue
-                reply = _format_status_reply(status)
+                print("  [converse] scheduled 30-min update -> get_patch_status_all")
+                reply, all_done, any_error = get_patch_status_all()
+                # A timeout/SSH failure on ANY target is NOT a clean status.
+                # If every target failed, skip this cycle entirely. If only
+                # some failed, still post what we have but alert Slack.
+                if any_error:
+                    print(f"  [converse] a status check failed: {reply}")
+                    notify_slack(f":warning: A patch status check failed:\n{reply}")
+                    if not reply.strip() or _is_status_error(reply):
+                        continue
                 send_teams_message(reply)
                 messages.append({"role": "assistant", "content": reply})
                 print(f"me   > {reply}")
-                # If everything is done, say so once and stop the timer.
-                if _is_all_patched(status):
-                    done = "All instances are now patched. I'll stop the updates here."
+                # Only announce completion + stop when EVERY target is done.
+                if all_done and not any_error:
+                    done = "All instances (Windows and RHEL) are now patched. I'll stop the updates here."
                     send_teams_message(done)
                     messages.append({"role": "assistant", "content": done})
                     print(f"me   > {done}")
@@ -1272,11 +1615,17 @@ def converse_teams(poll_seconds: int = 3, max_chat_fails: int = 3) -> None:
             # message clearly asks for a status update, run get_patch_status
             # ourselves and have the model just phrase the REAL numbers.
             if _is_status_request(latest):
-                print("  [converse] status request -> running get_patch_status")
-                status = get_patch_status()
-                # Send a concise, deterministic summary - do NOT let the small
-                # model rephrase/pad it (it waffles and invents detail).
-                reply = _format_status_reply(status)
+                explicit = _explicit_target(latest)
+                if explicit:
+                    # Named a specific OS/case -> answer just that fleet.
+                    print(f"  [converse] status request (explicit: "
+                          f"{[t['label'] or t['case'] for t in explicit]})")
+                    reply = get_patch_status(target=latest)
+                else:
+                    # General ask -> report all, or (if one fleet is done and
+                    # one outstanding) report the outstanding one and confirm.
+                    print("  [converse] status request (general)")
+                    reply = general_status_reply()
                 messages.append({"role": "assistant", "content": reply})
                 send_teams_message(reply)
                 print(f"me   > {reply}")
@@ -1449,16 +1798,15 @@ TOOLS_SCHEMA = [
             "description": (
                 "Get the latest NLB patching status by running the monitor over "
                 "SSH. Use whenever someone asks for an update on patching, e.g. "
-                "'any updates?', 'how many are left?', 'what's the status?'. "
-                "Returns totals (patched/pending/failed) and outstanding instances."
+                "'any updates?', 'how many are left?', 'what's the RHEL status?'. "
+                "There may be separate Windows and RHEL fleets. Returns a "
+                "labeled summary (remaining/pending per OS)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "case": {"type": "string",
-                             "description": "SR/case number (optional; defaults to NLB_CASE)."},
-                    "sr_account": {"type": "string",
-                                   "description": "SR account id (optional; defaults to NLB_SR_ACCOUNT)."},
+                    "target": {"type": "string",
+                               "description": "Which fleet: 'windows', 'rhel' (or 'linux'), or a case number. Leave blank to report ALL fleets."},
                 },
                 "required": [],
             },
@@ -1817,7 +2165,10 @@ def main() -> None:
             # tool directly instead of relying on the small model to call it.
             if _is_status_request(prompt):
                 print("[tools] status request -> running get_patch_status directly")
-                print(_format_status_reply(get_patch_status()))
+                if _explicit_target(prompt):
+                    print(get_patch_status(target=prompt))
+                else:
+                    print(general_status_reply())
                 return
             print(f"[model: {MODEL}]  running agent with tools...\n")
             reply, _ = agent(prompt)
