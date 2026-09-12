@@ -233,6 +233,18 @@ MONITOR_SCRIPT = os.environ.get("MONITOR_SCRIPT", "")
 NLB_CASE = os.environ.get("NLB_CASE", "")
 NLB_SR_ACCOUNT = os.environ.get("NLB_SR_ACCOUNT", "")
 
+# How long to wait for a single monitor run (seconds) and how many total
+# attempts to make when the run times out. On a timeout the agent retries
+# instead of giving up immediately, then reports the final result.
+try:
+    MONITOR_TIMEOUT = int(os.environ.get("MONITOR_TIMEOUT", "300"))
+except ValueError:
+    MONITOR_TIMEOUT = 300
+try:
+    MONITOR_ATTEMPTS = max(1, int(os.environ.get("MONITOR_ATTEMPTS", "2")))
+except ValueError:
+    MONITOR_ATTEMPTS = 2
+
 # --- Human pager (run over SSH when someone asks for a human) -----------------
 # When a meeting participant asks to speak to a real person / escalate, the
 # agent pages the on-call engineer(s) via:
@@ -296,36 +308,6 @@ def _build_patch_targets() -> list:
 
 
 PATCH_TARGETS = _build_patch_targets()
-
-
-def _has_multiple_fleets() -> bool:
-    """True only when more than one LABELED OS fleet is configured.
-
-    Legacy single-case mode (one unlabeled target) is NOT multiple fleets, so
-    the agent must not offer to break the status down by Windows/RHEL."""
-    return len([t for t in PATCH_TARGETS if t.get("label")]) > 1
-
-
-def _status_style_guidance() -> str:
-    """Guidance appended to the model's system prompt so it phrases status
-    replies correctly for the current config.
-
-    With a single case there are no separate fleets, so the model must just
-    report the number and NOT mention 'all fleets' or offer to check a specific
-    OS (Windows/RHEL)."""
-    if _has_multiple_fleets():
-        return (
-            "There are separate Windows and RHEL fleets. When asked generally, "
-            "report each fleet; if asked about one OS, report just that one."
-        )
-    return (
-        "There is only ONE patch case configured - there are NO separate "
-        "fleets. When reporting patch status, state ONLY the number remaining "
-        "exactly as the tool returned it. Do NOT say 'across all fleets', do "
-        "NOT offer to check a specific OS/fleet (Windows or RHEL), and do not "
-        "add commentary like 'great progress'. Keep it to one plain sentence."
-    )
-
 
 # Keyword aliases used to route a request to a specific OS target.
 _OS_ALIASES = {
@@ -511,19 +493,33 @@ def _run_monitor_once(case: str, sr_account: str) -> str:
         return "ERROR: invalid or missing SR account."
 
     remote_cmd = f"{MONITOR_SCRIPT} {case} {sr_account} --once"
-    log.info("[monitor] running (case %s): ssh %s %r", case, SSH_HOST, remote_cmd)
-    try:
-        proc = subprocess.run(
-            ["ssh", SSH_HOST, remote_cmd],
-            capture_output=True, text=True, timeout=300,
-            encoding="utf-8", errors="replace",  # monitor output has emojis
-        )
-    except FileNotFoundError:
-        log.error("[monitor] ssh not found on PATH (case %s)", case)
-        return "ERROR: ssh not found on PATH. Install/enable OpenSSH client."
-    except subprocess.TimeoutExpired:
-        log.error("[monitor] timed out after 300s (case %s)", case)
-        return "ERROR: Patch monitor timed out (no result within 5 minutes)."
+
+    # Run over SSH. A timeout is often transient (slow SSM/API call), so retry
+    # up to MONITOR_ATTEMPTS times before reporting back. FileNotFoundError
+    # (no ssh client) is not retryable and returns immediately.
+    proc = None
+    for attempt in range(1, MONITOR_ATTEMPTS + 1):
+        log.info("[monitor] running (case %s, attempt %d/%d): ssh %s %r",
+                 case, attempt, MONITOR_ATTEMPTS, SSH_HOST, remote_cmd)
+        try:
+            proc = subprocess.run(
+                ["ssh", SSH_HOST, remote_cmd],
+                capture_output=True, text=True, timeout=MONITOR_TIMEOUT,
+                encoding="utf-8", errors="replace",  # monitor output has emojis
+            )
+            break
+        except FileNotFoundError:
+            log.error("[monitor] ssh not found on PATH (case %s)", case)
+            return "ERROR: ssh not found on PATH. Install/enable OpenSSH client."
+        except subprocess.TimeoutExpired:
+            log.error("[monitor] timed out after %ds (case %s, attempt %d/%d)",
+                      MONITOR_TIMEOUT, case, attempt, MONITOR_ATTEMPTS)
+            if attempt < MONITOR_ATTEMPTS:
+                log.info("[monitor] retrying (case %s)", case)
+                continue
+            mins = MONITOR_TIMEOUT // 60
+            return (f"ERROR: Patch monitor timed out after {MONITOR_ATTEMPTS} "
+                    f"attempts (no result within {mins} minutes each).")
 
     out = (proc.stdout or "") + (proc.stderr or "")
     # Log the FULL raw monitor output. This is the single most useful thing for
@@ -540,8 +536,25 @@ def _run_monitor_once(case: str, sr_account: str) -> str:
         log.error("[monitor] non-zero exit %s (case %s)", proc.returncode, case)
         return f"ERROR: Monitor exited {proc.returncode}.\n{tail}"
 
-    # Extract the concise cycle summary if present, else return the tail.
     lines = out.splitlines()
+
+    # PREFER the authoritative STATUS JSON block. The monitor emits a
+    # machine-readable block between these markers with pending/failed,
+    # action_required, action_summary and the per-instance details (id,
+    # hostname, ssm_status). Return it verbatim so the status formatter can
+    # parse the exact instances that need attention. Falls back to the loose
+    # text summary only when no JSON block is present (older monitor output).
+    js_start = js_end = None
+    for i, ln in enumerate(lines):
+        if "--- STATUS JSON ---" in ln:
+            js_start = i
+        elif "--- END STATUS JSON ---" in ln and js_start is not None:
+            js_end = i
+            break
+    if js_start is not None and js_end is not None and js_end > js_start:
+        return "\n".join(lines[js_start:js_end + 1])
+
+    # Extract the concise cycle summary if present, else return the tail.
     summary = []
     capture = False
     for ln in lines:
@@ -1163,6 +1176,150 @@ def _is_human_request(text: str) -> bool:
     return bool(_HUMAN_REQUEST_RE.search(text or ""))
 
 
+# Markers in the monitor output that mean an instance needs human attention
+# even when the fleet reports "all patched / accounted for" (e.g. instances the
+# monitor counted as "Failed/Offline" because SSM can't reach them).
+_ACTION_REQUIRED_RE = re.compile(
+    r"(alert:|stale|terminated|retired|not registered|not in raw_data|"
+    r"offline|unreachable)",
+    re.IGNORECASE,
+)
+
+
+def _parse_status_json(status: str):
+    """Return the structured status dict from the monitor's STATUS JSON block.
+
+    The monitor emits an authoritative machine-readable block:
+        --- STATUS JSON ---
+        { "pending": 4, "failed": 0, "action_required": true,
+          "action_summary": "...", "pending_instances": [ {...}, ... ] }
+        --- END STATUS JSON ---
+    This is the single source of truth (instance_id, hostname, ssm_status,
+    requires_action) so we surface exactly what the monitor shared. Returns the
+    parsed dict, or None when no valid block is present.
+    """
+    if not status:
+        return None
+    import json as _json
+    start = status.find("--- STATUS JSON ---")
+    if start == -1:
+        return None
+    body = status[start + len("--- STATUS JSON ---"):]
+    end = body.find("--- END STATUS JSON ---")
+    if end != -1:
+        body = body[:end]
+    # The block may still carry leading log timestamps per line; grab from the
+    # first '{' to the matching last '}'.
+    lb = body.find("{")
+    rb = body.rfind("}")
+    if lb == -1 or rb == -1 or rb <= lb:
+        return None
+    try:
+        return _json.loads(body[lb:rb + 1])
+    except (ValueError, TypeError):
+        return None
+
+
+def _action_required_instances(data: dict) -> list:
+    """Instances from the STATUS JSON that explicitly need a human (SSM not
+    Online). Falls back to any instance flagged requires_action."""
+    out = []
+    for inst in (data.get("pending_instances") or []):
+        if inst.get("requires_action"):
+            out.append(inst)
+    return out
+
+
+def _format_instance_line(inst: dict) -> str:
+    """One clean line per instance: id | hostname | N patches | ssm_status."""
+    iid = inst.get("instance_id", "?")
+    host = inst.get("hostname", "?")
+    patches = inst.get("patches")
+    ssm = inst.get("ssm_status", "")
+    line = f"{iid} | {host}"
+    if patches is not None:
+        line += f" | {patches} patches"
+    if ssm:
+        line += f" | SSM: {ssm}"
+    return line
+
+
+def _instance_phrase(inst: dict) -> str:
+    """Conversational phrase for one instance, e.g.
+    'i-0c3f... (SR-...-win-19)'. Includes the hostname when we have it."""
+    iid = inst.get("instance_id", "?")
+    host = (inst.get("hostname") or "").strip()
+    return f"{iid} ({host})" if host else iid
+
+
+def _action_required_message(insts: list) -> str:
+    """Compose a conversational 'please restart the SSM agent' message.
+
+    Handles one OR many instances naturally, names the SSM status they're stuck
+    in (e.g. ConnectionLost), and asks the human to help start the agent.
+    """
+    # Group by the SSM status so the sentence reads naturally (they're usually
+    # all the same, e.g. ConnectionLost).
+    statuses = {(i.get("ssm_status") or "not Online") for i in insts}
+    status_txt = statuses.pop() if len(statuses) == 1 else "not reachable"
+
+    if len(insts) == 1:
+        phrase = _instance_phrase(insts[0])
+        return (f"This instance {phrase} is showing {status_txt} in SSM. "
+                f"Please help start the SSM agent (amazon-ssm-agent) on it so "
+                f"it can be patched.")
+
+    lines = "\n".join(f"- {_instance_phrase(i)}" for i in insts)
+    return (f"These {len(insts)} instances are showing {status_txt} in SSM. "
+            f"Please help start the SSM agent (amazon-ssm-agent) on them so "
+            f"they can be patched:\n{lines}")
+
+
+def _has_action_required(status: str) -> bool:
+    """True when the monitor output flags instances needing attention."""
+    if _is_status_error(status):
+        return False
+    data = _parse_status_json(status)
+    if data is not None:
+        return bool(data.get("action_required"))
+    return bool(_ACTION_REQUIRED_RE.search(status or ""))
+
+
+def _extract_outstanding_instances(status: str) -> list:
+    """Pull the per-instance 'Outstanding instances' lines from the monitor
+    output and return them as a list of clean strings.
+
+    The monitor emits this detail inside a Slack webhook JSON payload, e.g.:
+        "[NLB-...] \U0001f504 Outstanding instances:\\n
+         i-0affc184bfa06d7e3 | HOST (…) | N/A | 4 patches\\n
+         i-07fe917d0b379a35a | HOST (…) | N/A | 2 patches (ALERT: stale scan 73h)"
+    where the instance rows are separated by a literal '\\n'. We split on that
+    and keep only the 'i-<id> | …' rows so we surface exactly what the JSON
+    shared, no more, no less.
+    """
+    if not status:
+        return []
+    marker = "Outstanding instances:"
+    idx = status.find(marker)
+    if idx == -1:
+        return []
+    tail = status[idx + len(marker):]
+    # Rows are joined by a literal backslash-n in the captured webhook payload;
+    # also tolerate real newlines just in case.
+    import re as _re
+    parts = _re.split(r"\\n|\n", tail)
+    rows = []
+    for p in parts:
+        s = p.strip().strip('"').strip()
+        # Stop at the end of the JSON message / start of the next field.
+        s = s.split('"}')[0].strip()
+        if s.startswith("i-"):
+            rows.append(s)
+        elif rows and not s:
+            continue
+    return rows
+
+
 def _format_status_reply(status: str) -> str:
     """Build a short, deterministic status line from the monitor output.
 
@@ -1181,18 +1338,65 @@ def _format_status_reply(status: str) -> str:
 
     low_all = status.lower()
 
-    # NUMBERS FIRST. The monitor sometimes prints a completion sentence ("ALL
-    # instances patched or accounted for", "Monitor complete") even when
-    # instances are still pending or only "accounted for" as failed/offline.
-    # So we NEVER trust that phrase over a real count - we read the numbers and
-    # only fall back to the phrase when there are no numbers at all.
+    # 0) ACTION REQUIRED outranks everything. The monitor sometimes prints
+    #    "all instances patched / accounted for" while still listing instances
+    #    it could only mark Failed/Offline (SSM can't reach them, stale scan,
+    #    terminated/retired). Surface those exactly as the monitor shared them
+    #    and tell the human to restart the SSM agent, instead of reporting a
+    #    false "nothing remaining".
+    if _has_action_required(status):
+        # Prefer the authoritative STATUS JSON block (instance_id, hostname,
+        # ssm_status) so we name the exact instances the monitor flagged and
+        # ask, conversationally, for the SSM agent to be started.
+        data = _parse_status_json(status)
+        if data is not None:
+            insts = _action_required_instances(data)
+            if insts:
+                return _action_required_message(insts)
+            # action_required set but no per-instance detail -> use the summary.
+            summ = (data.get("action_summary") or "").strip()
+            if summ:
+                return (f"{summ}. Please help start the SSM agent "
+                        f"(amazon-ssm-agent) on the affected instance(s).")
+        # Legacy text format fallback (older monitor output).
+        rows = _extract_outstanding_instances(status)
+        if rows:
+            joined = "\n".join(f"- {r}" for r in rows)
+            noun = "instance is" if len(rows) == 1 else "instances are"
+            return (f"The following {noun} showing as unreachable in SSM. "
+                    f"Please help start the SSM agent (amazon-ssm-agent) on "
+                    f"them:\n{joined}")
+        return ("Some instances are showing as unreachable in SSM. Please help "
+                "start the SSM agent (amazon-ssm-agent) on the affected "
+                "instances.")
 
-    # 1) AUTHORITATIVE totals, e.g.
-    #      "Total: 38 | Patched: 38 | Pending: 0 | Failed: 0"
-    #    or the failure-summary variant
-    #      "Patched: 0 | Failed/Offline: 3".
+    # 0b) AUTHORITATIVE STATUS JSON with no action required -> report the
+    #     pending count straight from the block (outranks the noisier text).
+    _json_data = _parse_status_json(status)
+    if _json_data is not None and _json_data.get("pending") is not None:
+        pending = int(_json_data.get("pending"))
+        failed = int(_json_data.get("failed") or 0)
+        if pending == 0 and not failed:
+            return "Status: all instances are patched - nothing remaining."
+        noun = "instance" if pending == 1 else "instances"
+        msg = f"Status: {pending} {noun} remaining to be patched."
+        if failed:
+            msg = msg[:-1] + f" ({failed} failed)."
+        return msg
+
+    # 1) AUTHORITATIVE completion sentence. The monitor prints this only once
+    #    it has reconciled compliance for the whole fleet, so it outranks the
+    #    stale "N instance(s) remaining" startup echo below.
+    if ("all instances patched" in low_all
+            or "monitor complete" in low_all
+            or "all instances are patched" in low_all):
+        return "Status: all instances are patched - nothing remaining."
+
+    # 2) AUTHORITATIVE totals line, e.g.
+    #    "Total: 38 | Patched: 38 | Pending: 0 | Failed: 0".
+    #    This is the real cycle result; prefer it over the startup echo.
     total = patched = pending = failed = None
-    for key in ("total", "patched", "pending"):
+    for key in ("total", "patched", "pending", "failed"):
         m = _re.search(rf"{key}\s*[:=]\s*(\d+)", status, _re.IGNORECASE)
         if m:
             val = int(m.group(1))
@@ -1200,66 +1404,38 @@ def _format_status_reply(status: str) -> str:
                 total = val
             elif key == "patched":
                 patched = val
-            else:
+            elif key == "pending":
                 pending = val
-    # Failed count: accept "Failed:" and "Failed/Offline:".
-    m_failed = _re.search(r"failed(?:/offline)?\s*[:=]\s*(\d+)",
-                          status, _re.IGNORECASE)
-    if m_failed:
-        failed = int(m_failed.group(1))
+            elif key == "failed":
+                failed = val
 
-    # The "N remaining" echo and the automation-check line both state how many
-    # instances are NOT done. These are strong real signals, especially in the
-    # failure-summary case where there's no explicit "Pending:".
-    remaining_echo = None
-    m_remaining = _re.search(r"(\d+)\s+instance\(?s?\)?\s+remaining",
-                             status, _re.IGNORECASE)
-    if m_remaining:
-        remaining_echo = int(m_remaining.group(1))
-    m_autocheck = _re.search(
-        r"failure check for\s+(\d+)\s+remaining", status, _re.IGNORECASE)
-    if m_autocheck:
-        # Prefer the reconciled automation-check number when present.
-        remaining_echo = int(m_autocheck.group(1))
+    if pending is not None or (total is not None and patched is not None):
+        if pending is None and total is not None and patched is not None:
+            pending = total - patched
+        if pending == 0 and not failed:
+            return "Status: all instances are patched - nothing remaining."
+        noun = "instance" if pending == 1 else "instances"
+        msg = f"Status: {pending} {noun} remaining to be patched."
+        if failed:
+            msg = msg[:-1] + f" ({failed} failed)."
+        return msg
 
-    # Derive the number still outstanding from the best signal available.
-    outstanding = None
-    if pending is not None:
-        outstanding = pending
-    elif total is not None and patched is not None:
-        outstanding = total - patched
-    elif remaining_echo is not None:
-        # No pending/total, but we know how many remain (e.g. the
-        # "Patched: 0 | Failed/Offline: 3" summary + "3 remaining" line).
-        outstanding = remaining_echo
-
-    if outstanding is not None:
-        # Something failed/offline OR still pending -> NOT all patched.
-        if outstanding > 0 or failed:
-            n = outstanding if outstanding else (failed or 0)
-            noun = "instance" if n == 1 else "instances"
-            msg = f"Status: {n} {noun} remaining to be patched."
-            if failed:
-                # If everything remaining is failed/offline, say so clearly.
-                if outstanding and failed >= outstanding:
-                    msg = (f"Status: {n} {noun} still not patched "
-                           f"({failed} failed/offline).")
-                else:
-                    msg = msg[:-1] + f" ({failed} failed)."
-            return msg
-        # outstanding == 0 and no failures -> genuinely done.
-        return "Status: all instances are patched - nothing remaining."
-
-    # 2) "All compliant / input is empty" -> nothing left to patch.
+    # 3) "All compliant / input is empty" -> nothing left to patch.
     if "compliant" in low_all or "is empty" in low_all:
         return "Status: all instances are patched - nothing remaining."
 
-    # 3) Only NOW, with no numbers to read at all, trust the completion phrase.
-    if ("all instances patched" in low_all
-            or "monitor complete" in low_all
-            or "all instances are patched" in low_all
-            or "accounted for" in low_all):
-        return "Status: all instances are patched - nothing remaining."
+    # 4) LAST RESORT: the "N instance(s) remaining" line. This is a startup
+    #    echo printed BEFORE compliance is reconciled, so it can be stale (it
+    #    still shows the pre-patch count even when everything is done). Only
+    #    trust it when none of the authoritative signals above were present.
+    m_remaining = _re.search(r"(\d+)\s+instance\(?s?\)?\s+remaining",
+                             status, _re.IGNORECASE)
+    if m_remaining is not None:
+        n = int(m_remaining.group(1))
+        if n == 0:
+            return "Status: all instances are patched - nothing remaining."
+        noun = "instance" if n == 1 else "instances"
+        return f"Status: {n} {noun} remaining to be patched."
 
     # Fallback: couldn't parse totals -> return a meaningful line, skipping
     # monitor log noise (timestamps, banners, config echoes).
@@ -1295,6 +1471,20 @@ def _is_all_patched(status: str) -> bool:
     # An error/timeout is NOT completion -> don't stop the timer on it.
     if _is_status_error(status):
         return False
+
+    # Instances the monitor could only mark Failed/Offline (SSM unreachable,
+    # stale scan, terminated/retired) are NOT "patched" - a human still needs
+    # to restart the SSM agent. Never treat these as completion.
+    if _has_action_required(status):
+        return False
+
+    # Authoritative STATUS JSON: complete only when pending and failed are 0.
+    data = _parse_status_json(status)
+    if data is not None:
+        pending = data.get("pending")
+        failed = data.get("failed") or 0
+        if pending is not None:
+            return int(pending) == 0 and int(failed) == 0
 
     low = status.lower()
 
@@ -1739,7 +1929,12 @@ CONVERSE_SYSTEM_PROMPT = (
     "When asked for a patching update/status or how many instances are left, "
     "you MUST call the get_patch_status tool and reply with the real numbers - "
     "never guess or say it's 'being updated' without checking. "
-    + _status_style_guidance() + " "
+    "There may be separate Windows and RHEL fleets: if someone asks about a "
+    "specific OS (e.g. 'RHEL status', 'how's Windows?'), pass that OS as the "
+    "tool's `target`; if they ask generally, leave `target` blank to report "
+    "all fleets. "
+    "After reporting patch status, do not offer follow-up breakdowns (e.g. by "
+    "OS, fleet, or case) unless the person asks for them. "
     "If someone asks to speak to a real person, wants to escalate, or asks for "
     "a human/David to step in, call the page_human tool, then tell them you've "
     "paged the on-call engineer and someone will join shortly. "
@@ -2391,14 +2586,6 @@ def agent(prompt: str, messages: list | None = None, max_steps: int = 5):
     """Run one tool-calling turn and return (reply, messages)."""
     if messages is None:
         messages = []
-    # Seed a system message once so status replies match the current config
-    # (e.g. no fleet talk when only one case is set).
-    if not any(m.get("role") == "system" for m in messages):
-        messages.insert(0, {
-            "role": "system",
-            "content": ("You are a helpful assistant with tools. "
-                        + _status_style_guidance()),
-        })
     messages.append({"role": "user", "content": prompt})
 
     for step in range(max_steps):
