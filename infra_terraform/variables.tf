@@ -27,3 +27,27 @@ variable "azs" {
   type        = list(string)
   default     = ["us-east-1a", "us-east-1b"]
 }
+
+variable "enable_alb_access_logs" {
+  description = "Whether to enable ALB access logging to S3"
+  type        = bool
+  default     = true
+}
+
+variable "alb_logs_bucket_name" {
+  description = "Optional explicit S3 bucket name for ALB access logs. If empty, a name is derived from project_tag + account id."
+  type        = string
+  default     = ""
+}
+
+variable "alb_logs_prefix" {
+  description = "Prefix (folder) within the S3 bucket for ALB access logs"
+  type        = string
+  default     = "alb"
+}
+
+variable "alb_logs_retention_days" {
+  description = "Number of days to retain ALB access log objects before expiration"
+  type        = number
+  default     = 30
+}
