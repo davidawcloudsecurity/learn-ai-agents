@@ -7,6 +7,18 @@ provider "aws" {
 }
 
 # =============================================================================
+# Account / Region lookups
+# =============================================================================
+
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+
+# Regional ELB service account (used for the S3 bucket policy that authorizes
+# the load balancer to deliver access logs).
+data "aws_elb_service_account" "main" {}
+
+# =============================================================================
 # VPC + Networking (Public only, no NAT)
 # =============================================================================
 
@@ -396,6 +408,114 @@ resource "aws_instance" "backend" {
 }
 
 # =============================================================================
+# S3 Bucket for ALB Access Logs
+# =============================================================================
+
+locals {
+  # Whether to actually provision ALB logging (requires the VPC/ALB too).
+  alb_logs_enabled = var.create_vpc && var.enable_alb_access_logs
+
+  # Derive a globally-unique bucket name when one isn't explicitly provided.
+  alb_logs_bucket = var.alb_logs_bucket_name != "" ? var.alb_logs_bucket_name : "${var.project_tag}-alb-logs-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_bucket" "alb_logs" {
+  count         = local.alb_logs_enabled ? 1 : 0
+  bucket        = local.alb_logs_bucket
+  force_destroy = true
+
+  tags = {
+    Name = "${var.project_tag}-alb-logs"
+  }
+}
+
+# Keep the bucket private.
+resource "aws_s3_bucket_public_access_block" "alb_logs" {
+  count                   = local.alb_logs_enabled ? 1 : 0
+  bucket                  = aws_s3_bucket.alb_logs[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Server-side encryption for the log objects.
+resource "aws_s3_bucket_server_side_encryption_configuration" "alb_logs" {
+  count  = local.alb_logs_enabled ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Expire old access logs to control cost.
+resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
+  count  = local.alb_logs_enabled ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+
+  rule {
+    id     = "expire-alb-logs"
+    status = "Enabled"
+
+    filter {
+      prefix = "${var.alb_logs_prefix}/"
+    }
+
+    expiration {
+      days = var.alb_logs_retention_days
+    }
+  }
+}
+
+# Bucket policy authorizing the ELB to deliver access logs.
+# Uses the regional ELB service account for the ACL-based delivery path.
+resource "aws_s3_bucket_policy" "alb_logs" {
+  count  = local.alb_logs_enabled ? 1 : 0
+  bucket = aws_s3_bucket.alb_logs[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowELBAccountPutObject"
+        Effect = "Allow"
+        Principal = {
+          AWS = data.aws_elb_service_account.main.arn
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.alb_logs[0].arn}/${var.alb_logs_prefix}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+      },
+      {
+        Sid    = "AllowLogDeliveryPutObject"
+        Effect = "Allow"
+        Principal = {
+          Service = "logdelivery.elasticloadbalancing.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.alb_logs[0].arn}/${var.alb_logs_prefix}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = "bucket-owner-full-control"
+          }
+        }
+      },
+      {
+        Sid    = "AllowLogDeliveryGetBucketAcl"
+        Effect = "Allow"
+        Principal = {
+          Service = "logdelivery.elasticloadbalancing.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = aws_s3_bucket.alb_logs[0].arn
+      }
+    ]
+  })
+}
+
+# =============================================================================
 # Application Load Balancer
 # =============================================================================
 
@@ -406,6 +526,18 @@ resource "aws_lb" "alb" {
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg[0].id]
   subnets            = aws_subnet.public[*].id
+
+  dynamic "access_logs" {
+    for_each = local.alb_logs_enabled ? [1] : []
+    content {
+      bucket  = aws_s3_bucket.alb_logs[0].id
+      prefix  = var.alb_logs_prefix
+      enabled = true
+    }
+  }
+
+  # Ensure the bucket policy exists before the ALB tries to write logs.
+  depends_on = [aws_s3_bucket_policy.alb_logs]
 
   tags = {
     Name = "${var.project_tag}-alb"
@@ -523,6 +655,11 @@ output "vpc_flow_log_group" {
 output "alb_dns_name" {
   description = "ALB DNS name"
   value       = var.create_vpc ? aws_lb.alb[0].dns_name : null
+}
+
+output "alb_logs_bucket" {
+  description = "S3 bucket receiving ALB access logs (null when logging disabled)"
+  value       = local.alb_logs_enabled ? aws_s3_bucket.alb_logs[0].id : null
 }
 
 # output "frontend_public_ip" - commented out with the frontend EC2 instance.
