@@ -1,5 +1,6 @@
-### coding
+### Free coding agent
 https://dev.to/chirag127/the-ultimate-guide-100-best-free-ai-coding-agents-platforms-november-2025-230a
+https://www.nxcode.io/resources/news/best-free-ai-coding-tools-2026
 
 # Open Model
 ```
