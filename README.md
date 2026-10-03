@@ -1,3 +1,6 @@
+### coding
+https://dev.to/chirag127/the-ultimate-guide-100-best-free-ai-coding-agents-platforms-november-2025-230a
+
 # Open Model
 ```
 General Purpose Models
