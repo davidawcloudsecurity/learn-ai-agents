@@ -113,3 +113,10 @@ https://arxiv.org/pdf/2210.03629
 ```
 https://aws.amazon.com/what-is/ai-agents/#what-are-ai-agents--njg10c
 ```
+### How to run python in windows command prompt without lag or hung
+
+```
+ & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir=C:\temp\chrome_debug_profile --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows           
+```
+
+
